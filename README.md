@@ -119,6 +119,43 @@ same environment variable. Never commit the key or put it in a source file.
 - A failed or unexpected Jev response fails the compaction call rather than
   silently deleting content.
 
+## Claude Code integration
+
+Claude Code hooks can use this library to preserve verbatim context around
+Claude's built-in compaction. The command hook configuration is in
+`examples/claude-code-settings.json`:
+
+```sh
+npm install fast-jev-compaction
+export TYPESAFE_API_KEY="$(cat ~/.typesafe_key)"
+export FAST_JEV_GOAL="Describe the ongoing coding task"
+```
+
+Copy the `hooks` object from that file into `~/.claude/settings.json`. The
+`PreCompact` hook snapshots the JSONL transcript before Claude compacts it.
+The `SessionStart` hook with matcher `compact` reads that snapshot, asks Jev
+which chunks to keep, and injects selected verbatim chunks as
+`hookSpecificOutput.additionalContext`. Hook failures return exit code 0 and
+write an error to stderr so they never block Claude.
+
+This supplements Claude Code's summary; it does not replace it. Claude Code
+does not expose a documented history-replacement hook or a supported way to
+provide a custom transcript to its built-in compactor. Claude Code also
+documents its transcript entry format as internal and version-dependent, so
+the parser is intentionally best-effort and may need updates:
+
+- Hooks reference: https://code.claude.com/docs/en/hooks
+- Hooks guide, including reinjection after compaction:
+  https://code.claude.com/docs/en/hooks-guide
+- Session transcripts and resume:
+  https://code.claude.com/docs/en/sessions
+- Agent SDK TypeScript hooks:
+  https://code.claude.com/docs/en/agent-sdk/typescript
+
+For an in-process Agent SDK example, see `examples/agent-sdk.ts`. It is a
+reference file and is not type-checked unless the optional
+`@anthropic-ai/claude-agent-sdk` package is installed.
+
 ## Prior art
 
 The protected and classified keep categories mirror the information that
