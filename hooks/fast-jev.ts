@@ -10,6 +10,8 @@ import type {
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { goalFromMessages } from '../src/state.js';
+import { trimOutput } from '../src/output.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -20,6 +22,9 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
+  bashOutput: true,
+  bashOutputMinChars: 4_000,
+  bashOutputChunkLines: 20,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
@@ -42,6 +47,9 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  bashOutput: boolean;
+  bashOutputMinChars: number;
+  bashOutputChunkLines: number;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -55,6 +63,11 @@ function optionNumber(options: PluginOptions, key: string, fallback: number): nu
 function optionString(options: PluginOptions, key: string): string | undefined {
   const value = options[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function optionBoolean(options: PluginOptions, key: string, fallback: boolean): boolean {
+  const value = options[key];
+  return typeof value === 'boolean' ? value : fallback;
 }
 
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
@@ -72,6 +85,17 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   }
   const config: HookConfig = {
     ...numbers,
+    bashOutput: optionBoolean(options, 'bashOutput', HOOK_DEFAULTS.bashOutput),
+    bashOutputMinChars: optionNumber(
+      options,
+      'bashOutputMinChars',
+      HOOK_DEFAULTS.bashOutputMinChars,
+    ),
+    bashOutputChunkLines: optionNumber(
+      options,
+      'bashOutputChunkLines',
+      HOOK_DEFAULTS.bashOutputChunkLines,
+    ),
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
     minReductionRatio: optionNumber(
       options,
@@ -259,6 +283,59 @@ function notify(
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+
+  if (configured.bashOutput) {
+    on('tool.call', { tool: 'Bash' }, async ($, event, next) => {
+      const answer = await next(event);
+      try {
+        if (answer.deny !== undefined || answer.isError || !answer.result) return answer;
+        const record = answer.result;
+        const combined = record.stdout + (record.stderr ? `\n${record.stderr}` : '');
+        if (combined.length <= configured.bashOutputMinChars) return answer;
+        const apiKey = await getApiKey($, configured);
+        if (!apiKey) return answer;
+        const goal = goalFromMessages(await $.session.messages());
+        const path = `.claude/fast-jev-compaction/bash-${event.tool_use_id ?? Date.now()}.txt`;
+        await $.fs.write(path, combined);
+        const trimmed = await trimOutput(
+          {
+            command: event.command,
+            goal,
+            output: record.stdout,
+            fullOutputPath: path,
+          },
+          jevAsker(
+            async (url, init) => {
+              const response = await $.http.fetch(url, init);
+              return { status: response.status, ok: response.ok, text: response.text };
+            },
+            apiKey,
+            configured.model,
+          ),
+          {
+            minChars: configured.bashOutputMinChars,
+            chunkLines: configured.bashOutputChunkLines,
+            keepThreshold: configured.keepThreshold,
+            maxStateTokens: configured.maxStateTokens,
+          },
+        );
+        if (!trimmed.trimmed) return answer;
+        const scores = trimmed.scores.map((score) => score.toFixed(2)).join(',');
+        $.ui.log(
+          `bash output: kept ${trimmed.kept}/${trimmed.chunks} chunks (${trimmed.charsBefore}→${trimmed.charsAfter} chars) scores=${scores}`,
+        );
+        $.ui.toast(
+          `fast-jev-compaction: trimmed Bash output ${trimmed.charsBefore}→${trimmed.charsAfter} chars`,
+          { timeoutMs: 8_000 },
+        );
+        return { result: { ...record, stdout: trimmed.output } };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        $.ui.log(`bash output trim skipped (${message})`);
+        return answer;
+      }
+    });
+  }
 
   on('session.compact', async ($, event, next) => {
     try {

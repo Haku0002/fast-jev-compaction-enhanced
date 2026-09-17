@@ -1,0 +1,135 @@
+import { describe, expect, it } from 'vitest';
+import { trimOutput } from '../src/output.js';
+import type { JevAsker } from '../src/types.js';
+import { resolveHookConfig } from '../hooks/fast-jev.ts';
+
+function askerFor(score: (id: string) => number, calls: { count: number }): JevAsker {
+  return {
+    async ask(_state, questions) {
+      calls.count += 1;
+      return {
+        answers: Object.fromEntries(
+          Object.keys(questions).map((id) => [
+            id,
+            { type: 'noul' as const, noul: score(id) },
+          ]),
+        ),
+      };
+    },
+  };
+}
+
+function outputLines(): string[] {
+  return Array.from({ length: 200 }, (_, index) => `line-${index + 1}`);
+}
+
+describe('trimOutput', () => {
+  it('passes short output through without asking Jev', async () => {
+    const calls = { count: 0 };
+    const output = 'short output';
+    const result = await trimOutput(
+      { command: 'printf short', goal: 'test', output },
+      askerFor(() => 0, calls),
+    );
+    expect(calls.count).toBe(0);
+    expect(result).toEqual({
+      output,
+      trimmed: false,
+      chunks: 0,
+      kept: 0,
+      dropped: 0,
+      charsBefore: output.length,
+      charsAfter: output.length,
+      scores: [],
+    });
+  });
+
+  it('keeps selected chunks and collapses dropped runs with markers', async () => {
+    const calls = { count: 0 };
+    const lines = outputLines();
+    const output = lines.join('\n');
+    const result = await trimOutput(
+      {
+        command: 'run command',
+        goal: 'fix the test',
+        output,
+        fullOutputPath: '.claude/full.txt',
+      },
+      askerFor((id) => (id === 'c1' || id === 'c3' ? 0.9 : 0.1), calls),
+      { minChars: 1, chunkLines: 20, keepThreshold: 0.5 },
+    );
+
+    const chunk = (number: number): string =>
+      lines.slice((number - 1) * 20, number * 20).join('\n');
+    expect(calls.count).toBe(1);
+    expect(result.trimmed).toBe(true);
+    expect(result.chunks).toBe(10);
+    expect(result.kept).toBe(3);
+    expect(result.dropped).toBe(7);
+    expect(result.scores).toHaveLength(10);
+    expect(result.scores[9]).toBe(0.1);
+    expect(result.output).toContain(chunk(1));
+    expect(result.output).toContain(chunk(3));
+    expect(result.output).toContain(chunk(10));
+    expect(result.output).toContain(
+      `[fast-jev-compaction trimmed 20 lines (${chunk(2).length} chars); full output: .claude/full.txt]`,
+    );
+    expect(result.output).toContain(
+      `[fast-jev-compaction trimmed 120 lines (${[4, 5, 6, 7, 8, 9]
+        .map((number) => chunk(number).length)
+        .reduce((sum, chars) => sum + chars, 0) + 5} chars); full output: .claude/full.txt]`,
+    );
+    expect(result.output.indexOf(chunk(1))).toBeLessThan(result.output.indexOf(chunk(3)));
+    expect(result.output.indexOf(chunk(3))).toBeLessThan(result.output.indexOf(chunk(10)));
+    expect(result.charsAfter).toBeLessThan(result.charsBefore);
+  });
+
+  it('returns the original output when every chunk is kept', async () => {
+    const output = outputLines().join('\n');
+    const result = await trimOutput(
+      { command: 'run command', goal: 'test', output },
+      askerFor(() => 0.9, { count: 0 }),
+      { minChars: 1, chunkLines: 20 },
+    );
+    expect(result.trimmed).toBe(false);
+    expect(result.output).toBe(output);
+    expect(result.dropped).toBe(0);
+    expect(result.charsAfter).toBe(result.charsBefore);
+  });
+
+  it('rejects when Jev fails', async () => {
+    const asker: JevAsker = {
+      async ask() {
+        throw new Error('network unavailable');
+      },
+    };
+    await expect(
+      trimOutput(
+        { command: 'run command', goal: 'test', output: outputLines().join('\n') },
+        asker,
+        { minChars: 1, chunkLines: 20 },
+      ),
+    ).rejects.toThrow('network unavailable');
+  });
+});
+
+describe('Bash output hook options', () => {
+  it('uses the Bash trimming defaults and accepts overrides', () => {
+    expect(resolveHookConfig({})).toMatchObject({
+      bashOutput: true,
+      bashOutputMinChars: 4_000,
+      bashOutputChunkLines: 20,
+    });
+    expect(
+      resolveHookConfig({
+        bashOutput: false,
+        bashOutputMinChars: 100,
+        bashOutputChunkLines: 5,
+      }),
+    ).toMatchObject({
+      bashOutput: false,
+      bashOutputMinChars: 100,
+      bashOutputChunkLines: 5,
+    });
+  });
+});
