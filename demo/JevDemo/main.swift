@@ -274,69 +274,16 @@ struct TokenCounter: View, Animatable {
     }
 
     var body: some View {
-        let saved = max(0, 1 - value / DemoTokens.before)
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("CONTEXT TOKENS")
-                    .font(.system(size: 11, weight: .semibold))
-                    .tracking(2)
-                    .foregroundStyle(Palette.dim)
-                Spacer()
-                Text("fast-jev-compaction")
-                    .font(monoSmall)
-                    .foregroundStyle(Palette.cyan)
-            }
-            HStack(alignment: .center) {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
-                        .font(.system(size: 54, weight: .medium, design: .rounded))
-                        .tracking(-1.5)
-                        .monospacedDigit()
-                        .foregroundStyle(Palette.fg)
-                    Text("/ 200k")
-                        .font(.system(size: 18, weight: .regular, design: .rounded))
-                        .foregroundStyle(Palette.dim)
-                }
-                Spacer()
-                HStack(spacing: 7) {
-                    Image(systemName: "arrow.down.right")
-                    Text(saved.formatted(.percent.precision(.fractionLength(1))))
-                        .monospacedDigit()
-                    Text("less")
-                }
-                .font(.system(size: 16, weight: .semibold, design: .rounded))
-                .foregroundStyle(Palette.green)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(Capsule().fill(Palette.green.opacity(0.12)))
-                .overlay(Capsule().stroke(Palette.green.opacity(0.25), lineWidth: 1))
-                .opacity(min(1, saved * 15))
-            }
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Palette.border.opacity(0.7))
-                    Capsule()
-                        .fill(LinearGradient(
-                            colors: [Palette.cyan, Palette.green],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ))
-                        .frame(width: geometry.size.width * value / DemoTokens.capacity)
-                }
-            }
-            .frame(height: 4)
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
+                .font(.system(size: 32, weight: .medium, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(value < DemoTokens.before ? Palette.green : Palette.fg)
+            Text("tokens")
+                .font(mono)
+                .foregroundStyle(Palette.dim)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .background(
-            RoundedRectangle(cornerRadius: 14)
-                .fill(LinearGradient(
-                    colors: [Palette.panel, Palette.bg],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ))
-        )
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.border, lineWidth: 1))
+        .fixedSize()
     }
 }
 
@@ -371,9 +318,21 @@ struct TerminalView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            TokenCounter(value: demo.tokens)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
+            VStack(spacing: 14) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("✻").foregroundStyle(Palette.orange)
+                    Text("fast-jev-compaction").foregroundStyle(Palette.dim)
+                    Spacer()
+                    TokenCounter(value: demo.tokens)
+                }
+                .font(mono)
+                Rectangle()
+                    .fill(Palette.border.opacity(0.6))
+                    .frame(height: 1)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 10)
 
             GeometryReader { container in
                 VStack(alignment: .leading, spacing: 3) {
