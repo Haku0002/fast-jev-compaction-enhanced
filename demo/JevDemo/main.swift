@@ -254,14 +254,18 @@ struct ChunkView: View {
 
     var badge: some View {
         let color = tint ?? Palette.dim
-        return Text(chunk.verdict.isDrop ? "DROP" : "KEEP")
-            .bold()
-            .padding(.horizontal, 8)
-            .padding(.vertical, 2)
-            .background(RoundedRectangle(cornerRadius: 3).fill(color.opacity(0.22)))
-            .foregroundStyle(color)
-            .font(monoSmall)
-            .fixedSize()
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text("p(drop) \(chunk.drop.formatted(.number.precision(.fractionLength(2)).locale(Locale(identifier: "en_US"))))")
+                .monospacedDigit()
+            Text(chunk.verdict.isDrop ? "DROP" : "KEEP")
+                .bold()
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(RoundedRectangle(cornerRadius: 3).fill(color.opacity(0.22)))
+        }
+        .foregroundStyle(color)
+        .font(monoSmall)
+        .fixedSize()
     }
 }
 
