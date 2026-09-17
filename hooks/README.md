@@ -75,9 +75,10 @@ reduction, per-reason counts, state size and request count; a per-call
 `decisions:` line with both probabilities is logged for diagnosis. The
 `tool.call` hook trims long Bash stdout before it reaches the model when
 `bashOutput` is enabled. It saves the combined stdout and stderr to the
-configured path, keeps Jev-selected output chunks verbatim, and replaces runs
-of discarded chunks with a marker pointing to the full output. If Jev fails,
-the Bash result passes through unchanged.
+project-relative `.claude/fast-jev-compaction/` path, keeps Jev-selected output
+chunks verbatim, and replaces runs of discarded chunks with a marker pointing
+to the full output. The directory is ignored with a local `.gitignore`. If Jev
+fails, the Bash result passes through unchanged.
 
 The Bash output options are:
 

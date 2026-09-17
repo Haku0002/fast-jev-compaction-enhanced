@@ -72,12 +72,12 @@ describe('trimOutput', () => {
     expect(result.output).toContain(chunk(3));
     expect(result.output).toContain(chunk(10));
     expect(result.output).toContain(
-      `[fast-jev-compaction trimmed 20 lines (${chunk(2).length} chars); full output: .claude/full.txt]`,
+      `[fast-jev-compaction trimmed 20 lines (${chunk(2).length} chars); full output: .claude/full.txt (Read or grep it if needed)]`,
     );
     expect(result.output).toContain(
       `[fast-jev-compaction trimmed 120 lines (${[4, 5, 6, 7, 8, 9]
         .map((number) => chunk(number).length)
-        .reduce((sum, chars) => sum + chars, 0) + 5} chars); full output: .claude/full.txt]`,
+        .reduce((sum, chars) => sum + chars, 0) + 5} chars); full output: .claude/full.txt (Read or grep it if needed)]`,
     );
     expect(result.output.indexOf(chunk(1))).toBeLessThan(result.output.indexOf(chunk(3)));
     expect(result.output.indexOf(chunk(3))).toBeLessThan(result.output.indexOf(chunk(10)));

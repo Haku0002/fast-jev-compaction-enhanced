@@ -139,7 +139,9 @@ Claude Code 2.1.274 type reference.
 When enabled, the plugin's Bash output hook runs after Bash completes and
 before the result reaches the model. Jev keeps the chunks needed to understand
 the command, while discarded runs become markers that point to a saved full
-output file. Set `bashOutput` to `false` to disable this behavior.
+output file under the project's `.claude/fast-jev-compaction/` directory. The
+directory is locally ignored so the dumps are not committed. Set `bashOutput`
+to `false` to disable this behavior.
 
 ### Install in Claude Code
 

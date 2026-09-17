@@ -123,7 +123,7 @@ function outputMarker(
   const chars =
     chunks.reduce((sum, chunk) => sum + chunk.chars, 0) + Math.max(0, chunks.length - 1);
   return `[fast-jev-compaction trimmed ${lines} lines (${chars} chars)${
-    fullOutputPath ? `; full output: ${fullOutputPath}` : ''
+    fullOutputPath ? `; full output: ${fullOutputPath} (Read or grep it if needed)` : ''
   }]`;
 }
 
