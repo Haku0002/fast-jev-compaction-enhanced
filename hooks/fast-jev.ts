@@ -327,7 +327,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           `bash output: kept ${trimmed.kept}/${trimmed.chunks} chunks (${trimmed.charsBefore}→${trimmed.charsAfter} chars) scores=${scores}`,
         );
         $.ui.toast(
-          `fast-jev-compaction: trimmed Bash output ${trimmed.charsBefore}→${trimmed.charsAfter} chars`,
+          `trimmed Bash output ${trimmed.charsBefore}→${trimmed.charsAfter} chars`,
           { timeoutMs: 8_000 },
         );
         return { result: { ...record, stdout: trimmed.output } };
