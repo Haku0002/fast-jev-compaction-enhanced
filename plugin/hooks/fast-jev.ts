@@ -42,6 +42,7 @@ const DEFAULTS = {
   minReductionRatio: 0.25,
   maxWindowChars: 60_000,
   previewChars: 800,
+  truncateHeadChars: 300,
   model: 'jev-latest',
 };
 
@@ -75,14 +76,16 @@ export type CompactionUnit = {
 export type UnitDecision = {
   id: string;
   drop: number;
+  truncate: number;
   kind: Kind;
   kindConfidence: number;
-  action: 'keep' | 'drop';
+  action: 'keep' | 'truncate' | 'drop';
   reason:
     | 'pinned'
     | 'protected_kind'
     | 'below_threshold'
     | 'low_confidence'
+    | 'truncated'
     | 'dropped';
 };
 
@@ -97,6 +100,7 @@ export type ModConfig = {
   minReductionRatio?: number;
   maxWindowChars?: number;
   previewChars?: number;
+  truncateHeadChars?: number;
   model?: string;
   goal?: string;
 };
@@ -112,6 +116,7 @@ type ResolvedConfig = {
   minReductionRatio: number;
   maxWindowChars: number;
   previewChars: number;
+  truncateHeadChars: number;
   model: string;
   goal: string;
 };
@@ -209,6 +214,12 @@ function resolveConfig(options: PluginOptions | ModConfig): ResolvedConfig {
     previewChars: Math.max(
       1,
       Math.floor(optionNumber(options, 'previewChars', DEFAULTS.previewChars)),
+    ),
+    truncateHeadChars: Math.max(
+      1,
+      Math.floor(
+        optionNumber(options, 'truncateHeadChars', DEFAULTS.truncateHeadChars),
+      ),
     ),
     model: optionString(options, 'model', DEFAULTS.model),
     goal: optionString(options, 'goal', ''),
@@ -327,16 +338,22 @@ export function packWindows(
 
 export function decideUnit(
   unit: Pick<CompactionUnit, 'id' | 'pinned'> & Partial<Pick<CompactionUnit, 'toolOutput'>>,
-  answer: { drop: number; kind: Kind; kindConfidence: number },
+  answer: {
+    drop: number;
+    truncate?: number;
+    kind: Kind;
+    kindConfidence: number;
+  },
   config: Pick<
     ResolvedConfig,
-    'dropThreshold' | 'toolOutputDropThreshold' | 'minKindConfidence' | 'protectedKinds'
-  >,
+    'dropThreshold' | 'minKindConfidence' | 'protectedKinds'
+  > & { toolOutputDropThreshold?: number },
 ): UnitDecision {
   if (unit.pinned) {
     return {
       id: unit.id,
       drop: 0,
+      truncate: 0,
       kind: 'other',
       kindConfidence: 0,
       action: 'keep',
@@ -346,6 +363,7 @@ export function decideUnit(
   const decision: UnitDecision = {
     id: unit.id,
     drop: answer.drop,
+    truncate: answer.truncate ?? 0,
     kind: answer.kind,
     kindConfidence: answer.kindConfidence,
     action: 'keep',
@@ -356,10 +374,22 @@ export function decideUnit(
     answer.kindConfidence >= config.minKindConfidence
   ) {
     decision.reason = 'protected_kind';
-  } else if (
-    answer.drop <
-    (unit.toolOutput ? config.toolOutputDropThreshold : config.dropThreshold)
-  ) {
+  } else if (unit.toolOutput) {
+    const removal = answer.drop + (answer.truncate ?? 0);
+    const toolOutputThreshold =
+      config.toolOutputDropThreshold ?? DEFAULTS.toolOutputDropThreshold;
+    if (removal < toolOutputThreshold) {
+      decision.reason = 'below_threshold';
+    } else if (answer.kindConfidence < config.minKindConfidence) {
+      decision.reason = 'low_confidence';
+    } else if (answer.drop >= toolOutputThreshold) {
+      decision.action = 'drop';
+      decision.reason = 'dropped';
+    } else {
+      decision.action = 'truncate';
+      decision.reason = 'truncated';
+    }
+  } else if (answer.drop < config.dropThreshold) {
     decision.reason = 'below_threshold';
   } else if (answer.kindConfidence < config.minKindConfidence) {
     decision.reason = 'low_confidence';
@@ -387,6 +417,37 @@ function messageChars(message: SessionMessage): number {
   return total;
 }
 
+export function truncateToolResults(
+  messages: readonly SessionMessage[],
+  headChars: number,
+): SessionMessage[] {
+  const limit = Math.max(0, Math.floor(headChars)) + 120;
+  return messages.map((message) => {
+    const results = message.toolResults;
+    if (!results || !results.some((result) => result.text.length > limit)) {
+      return message;
+    }
+    return {
+      role: message.role,
+      text: message.text,
+      toolUses: message.toolUses,
+      toolResults: results.map((result) =>
+        result.text.length <= limit
+          ? {
+              tool_use_id: result.tool_use_id,
+              text: result.text,
+              isError: result.isError,
+            }
+          : {
+              tool_use_id: result.tool_use_id,
+              isError: result.isError,
+              text: `${result.text.slice(0, headChars)}\n[fast-jev-compaction truncated ${result.text.length - headChars} chars of this tool result; re-run the tool if you need it]`,
+            },
+      ),
+    };
+  });
+}
+
 function goalFromMessages(messages: readonly SessionMessage[]): string {
   return messages
     .filter(
@@ -404,11 +465,21 @@ function questionsFor(units: readonly CompactionUnit[]): Record<string, unknown>
   return Object.fromEntries(
     units.flatMap((unit) => [
       [
-        `drop_${unit.id}`,
-        {
-          type: 'noul',
-          instructions: `Unit ${unit.id} can be removed from the conversation without losing information the assistant needs to continue the current task. Tool results the assistant already acted on (file contents, listings, test output) can be re-read or re-run and are safe to remove; the user's instructions, constraints, decisions, errors and pending tasks must stay.`,
-        },
+        unit.toolOutput ? `fate_${unit.id}` : `drop_${unit.id}`,
+        unit.toolOutput
+          ? {
+              type: 'choice',
+              instructions: `What should happen to the tool result in unit ${unit.id} so the assistant can still continue the current task?`,
+              criteria: {
+                keep: 'The assistant still needs this tool result in full: it has not acted on it yet, or it is an error still being fixed',
+                truncate: 'The assistant already acted on this result; the first few lines are enough as a reminder of what was read or run, the rest can be re-read or re-run later',
+                drop: 'This tool call and its result are no longer relevant to the current task at all (superseded, exploratory, repeated); nothing of it needs to stay',
+              },
+            }
+          : {
+              type: 'noul',
+              instructions: `Unit ${unit.id} can be removed from the conversation without losing information the assistant needs to continue the current task. Tool results the assistant already acted on (file contents, listings, test output) can be re-read or re-run and are safe to remove; the user's instructions, constraints, decisions, errors and pending tasks must stay.`,
+            },
       ],
       [
         `kind_${unit.id}`,
@@ -425,9 +496,42 @@ function questionsFor(units: readonly CompactionUnit[]): Record<string, unknown>
 function answerFor(
   answers: Record<string, JevAnswer>,
   unit: CompactionUnit,
-): { drop: number; kind: Kind; kindConfidence: number } {
+): { drop: number; truncate: number; kind: Kind; kindConfidence: number } {
+  const fateAnswer = answers[`fate_${unit.id}`];
   const dropAnswer = answers[`drop_${unit.id}`];
   const kindAnswer = answers[`kind_${unit.id}`];
+  if (unit.toolOutput) {
+    if (
+      !fateAnswer ||
+      !('choice' in fateAnswer) ||
+      (fateAnswer.choice !== 'keep' &&
+        fateAnswer.choice !== 'truncate' &&
+        fateAnswer.choice !== 'drop') ||
+      typeof fateAnswer.confidence !== 'number' ||
+      !fateAnswer.probabilities ||
+      typeof fateAnswer.probabilities !== 'object' ||
+      typeof fateAnswer.probabilities.keep !== 'number' ||
+      typeof fateAnswer.probabilities.truncate !== 'number' ||
+      typeof fateAnswer.probabilities.drop !== 'number'
+    ) {
+      throw new Error(`Invalid Jev answers for ${unit.id}`);
+    }
+    if (
+      !kindAnswer ||
+      !('choice' in kindAnswer) ||
+      typeof kindAnswer.choice !== 'string' ||
+      !(kindAnswer.choice in KIND_CRITERIA) ||
+      typeof kindAnswer.confidence !== 'number'
+    ) {
+      throw new Error(`Invalid Jev answers for ${unit.id}`);
+    }
+    return {
+      drop: fateAnswer.probabilities.drop,
+      truncate: fateAnswer.probabilities.truncate,
+      kind: kindAnswer.choice as Kind,
+      kindConfidence: kindAnswer.confidence,
+    };
+  }
   if (
     !dropAnswer ||
     !('noul' in dropAnswer) ||
@@ -442,6 +546,7 @@ function answerFor(
   }
   return {
     drop: dropAnswer.noul,
+    truncate: 0,
     kind: kindAnswer.choice as Kind,
     kindConfidence: kindAnswer.confidence,
   };
@@ -531,13 +636,15 @@ export async function compactWithFetch(
       decideUnit(unit, { drop: 0, kind: 'other', kindConfidence: 0 }, config)
     );
   });
-  const dropped = new Set(
-    decisions
-      .filter((decision) => decision.action === 'drop')
-      .map((decision) => decision.id),
-  );
-  const keptUnits = units.filter((unit) => !dropped.has(unit.id));
-  const kept = keptUnits.flatMap((unit) => unit.messages);
+  const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
+  const kept = units.flatMap((unit) => {
+    const decision = decisionById.get(unit.id);
+    if (decision?.action === 'drop') return [];
+    if (decision?.action === 'truncate') {
+      return truncateToolResults(unit.messages, config.truncateHeadChars);
+    }
+    return unit.messages;
+  });
   return {
     messages: kept,
     decisions,
@@ -596,6 +703,11 @@ function optionConfig(options: PluginOptions): ModConfig {
       DEFAULTS.maxWindowChars,
     ),
     previewChars: optionNumber(options, 'previewChars', DEFAULTS.previewChars),
+    truncateHeadChars: optionNumber(
+      options,
+      'truncateHeadChars',
+      DEFAULTS.truncateHeadChars,
+    ),
     model: optionString(options, 'model', DEFAULTS.model),
   };
 }
@@ -648,23 +760,27 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
       );
       const dropped = result.decisions.filter((d) => d.action === 'drop').length;
+      const truncated = result.decisions.filter((d) => d.action === 'truncate').length;
       const pct = result.charsBefore === 0 ? 0 : Math.round((1 - result.charsAfter / result.charsBefore) * 100);
       $.ui.log(
         `decisions: ${result.decisions
-          .map((d) => `${d.id}:${d.action[0]}/${d.reason}/${d.kind}/drop=${d.drop.toFixed(2)}`)
+          .map(
+            (d) =>
+              `${d.id}:${d.action[0]}/${d.reason}/${d.kind}/drop=${d.drop.toFixed(2)}/trunc=${d.truncate.toFixed(2)}`,
+          )
           .join(' ')}`,
       );
       const reduction = result.charsBefore === 0 ? 0 : (result.charsBefore - result.charsAfter) / result.charsBefore;
       if (reduction < (config.minReductionRatio ?? DEFAULTS.minReductionRatio)) {
         notify(
           $,
-          `fallback to built-in summary (dropped ${dropped}/${result.decisions.length} units, -${pct}% chars, below minimum)`,
+          `fallback to built-in summary (truncated ${truncated} tool results, dropped ${dropped}/${result.decisions.length} units, -${pct}% chars, below minimum)`,
         );
         return next(event);
       }
       notify(
         $,
-        `kept ${result.messages.length}/${event.messages.length} messages verbatim, dropped ${dropped} units (-${pct}% chars, no summary)`,
+        `kept ${result.messages.length}/${event.messages.length} messages, truncated ${truncated} tool results, dropped ${dropped} units (-${pct}% chars, no summary)`,
       );
       return { messages: result.messages };
     } catch (error) {

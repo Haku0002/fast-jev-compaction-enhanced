@@ -19,8 +19,14 @@
     "toolOutputDropThreshold": {
       "type": "number",
       "title": "Tool output drop threshold",
-      "description": "Minimum Jev removal probability for units that contain tool results (file reads, command output).",
+      "description": "Minimum Jev probability (truncate + drop) for a unit that contains tool results to be truncated or dropped.",
       "default": 0.5
+    },
+    "truncateHeadChars": {
+      "type": "number",
+      "title": "Truncated tool result head",
+      "description": "Characters of a tool result kept when Jev decides to truncate it instead of dropping it.",
+      "default": 300
     },
     "minKindConfidence": {
       "type": "number",
