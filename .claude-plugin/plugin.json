@@ -34,6 +34,12 @@
       "description": "Minimum estimated character reduction required to replace history.",
       "default": 0.25
     },
+    "summarizeDropped": {
+      "type": "boolean",
+      "title": "Summarize dropped tool output",
+      "description": "Hand the messages Jev drops to Claude Code's summarizer and put that note in front of the kept messages.",
+      "default": true
+    },
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",

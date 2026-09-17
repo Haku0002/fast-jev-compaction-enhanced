@@ -51,8 +51,12 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 }
 
 describe('hook config', () => {
+  it('turns the summary of dropped messages off when asked', () => {
+    expect(resolveHookConfig({ summarizeDropped: false }).summarizeDropped).toBe(false);
+  });
+
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, summarizeDropped: true, model: 'jev-latest' });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -63,6 +67,7 @@ describe('hook config', () => {
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      summarizeDropped: true,
     });
   });
 });

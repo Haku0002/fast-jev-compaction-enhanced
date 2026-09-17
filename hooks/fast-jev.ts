@@ -20,6 +20,7 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
+  summarizeDropped: true,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
@@ -44,6 +45,7 @@ export type HookConfig = CompactOptions & {
   apiKey?: string;
   compactAtPercent: number;
   minReductionRatio: number;
+  summarizeDropped: boolean;
   model: string;
 };
 
@@ -79,6 +81,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       'minReductionRatio',
       HOOK_DEFAULTS.minReductionRatio,
     ),
+    summarizeDropped:
+      typeof options.summarizeDropped === 'boolean'
+        ? options.summarizeDropped
+        : HOOK_DEFAULTS.summarizeDropped,
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
   };
   const apiKey = optionString(options, 'apiKey');
@@ -232,6 +238,37 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/**
+ * Summarizes only what Jev dropped, by handing that subset to core compaction,
+ * so a detail that lived in a deleted tool result survives as a note in front
+ * of the verbatim messages. Returns [] when there is nothing to summarize or
+ * core declines.
+ */
+async function summaryOfDropped(
+  $: { ui: { log: (text: string) => void } },
+  event: { messages: readonly SessionMessage[] },
+  next: (e: never) => Promise<{ messages?: readonly SessionMessage[]; skip?: string }>,
+  kept: readonly SessionMessage[],
+): Promise<SessionMessage[]> {
+  const keptSet = new Set<SessionMessage>(kept);
+  const dropped = event.messages.filter((message) => !keptSet.has(message));
+  if (dropped.length === 0) return [];
+  try {
+    const summarized = await next({
+      ...event,
+      messages: dropped,
+      instructions:
+        'Record the concrete facts learned from these tool calls and their output: file paths, identifiers, names, numbers, settings, errors and decisions. These messages are being deleted; the rest of the conversation is kept verbatim.',
+    } as never);
+    return summarized.messages ? [...summarized.messages] : [];
+  } catch (error) {
+    $.ui.log(
+      `summary of dropped messages failed, keeping verbatim only (${error instanceof Error ? error.message : String(error)})`,
+    );
+    return [];
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
@@ -251,11 +288,16 @@ export const register: Register = (on: On, options: PluginOptions) => {
         );
         return next(event);
       }
+      const lead = config.summarizeDropped
+        ? await summaryOfDropped($, event, next, messages)
+        : [];
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `kept ${messages.length}/${event.messages.length} messages${
+          lead.length > 0 ? ` + ${lead.length} summary message(s) of what was dropped` : ', no summary'
+        } (${summarize(result)})`,
       );
-      return { messages };
+      return { messages: [...lead, ...messages] };
     } catch (error) {
       notify(
         $,
