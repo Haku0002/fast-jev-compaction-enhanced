@@ -16,11 +16,11 @@
       "description": "Minimum Jev removal probability.",
       "default": 0.8
     },
-    "minKindConfidence": {
+    "protectThreshold": {
       "type": "number",
-      "title": "Minimum kind confidence",
-      "description": "Minimum confidence for protected kinds and drops.",
-      "default": 0.5
+      "title": "Protect threshold",
+      "description": "Minimum Jev probability that a message is a standing user constraint or unfinished task; such messages are never dropped.",
+      "default": 0.7
     },
     "preserveRecentMessages": {
       "type": "number",

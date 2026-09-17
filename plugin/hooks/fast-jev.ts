@@ -8,33 +8,9 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-type Kind =
-  | 'user_instruction'
-  | 'decision'
-  | 'file_reference'
-  | 'error'
-  | 'pending_task'
-  | 'stale_tool_output'
-  | 'chatter'
-  | 'other';
-
-const KIND_CRITERIA: Record<Kind, string> = {
-  user_instruction:
-    'An instruction, constraint, preference, or request from the user',
-  decision: 'A design/implementation decision or key finding',
-  file_reference:
-    'Names a file path, symbol, command, URL or identifier that will be needed',
-  error: 'An error message or its fix',
-  pending_task: 'Work that still needs to be done',
-  stale_tool_output: 'Tool/file/log output that has already been acted on',
-  chatter: 'Greetings, acknowledgements, filler',
-  other: 'Other content that does not fit the categories above',
-};
-
 const DEFAULTS = {
   dropThreshold: 0.8,
-  minKindConfidence: 0.5,
-  protectedKinds: ['user_instruction', 'pending_task'] as Kind[],
+  protectThreshold: 0.7,
   preserveRecentMessages: 6,
   compactAtPercent: 60,
   minReductionRatio: 0.25,
@@ -44,6 +20,9 @@ const DEFAULTS = {
 };
 
 const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
+
+const COMPACTION_CONTEXT =
+  'A coding assistant conversation is being compacted to free context. Each unit is one message, or a tool call together with its result. Units judged removable are deleted permanently; kept units stay verbatim. The assistant can always re-read files and re-run commands, so tool output that has already been used is not needed again.';
 
 export type HookFetchInit = {
   method?: string;
@@ -69,25 +48,21 @@ export type CompactionUnit = {
   preview: string;
 };
 
-export type UnitDecision = {
-  id: string;
+export type UnitAnswer = {
   drop: number;
-  kind: Kind;
-  kindConfidence: number;
+  protect: number;
+};
+
+export type UnitDecision = UnitAnswer & {
+  id: string;
   action: 'keep' | 'drop';
-  reason:
-    | 'pinned'
-    | 'protected_kind'
-    | 'below_threshold'
-    | 'low_confidence'
-    | 'dropped';
+  reason: 'pinned' | 'protected' | 'below_threshold' | 'dropped';
 };
 
 export type ModConfig = {
   apiKey?: string;
   dropThreshold?: number;
-  minKindConfidence?: number;
-  protectedKinds?: Kind[];
+  protectThreshold?: number;
   preserveRecentMessages?: number;
   compactAtPercent?: number;
   minReductionRatio?: number;
@@ -100,8 +75,7 @@ export type ModConfig = {
 type ResolvedConfig = {
   apiKey?: string;
   dropThreshold: number;
-  minKindConfidence: number;
-  protectedKinds: Set<Kind>;
+  protectThreshold: number;
   preserveRecentMessages: number;
   compactAtPercent: number;
   minReductionRatio: number;
@@ -111,14 +85,7 @@ type ResolvedConfig = {
   goal: string;
 };
 
-type JevAnswer =
-  | { type?: 'noul'; noul: number }
-  | {
-      type?: 'choice';
-      choice: string;
-      confidence: number;
-      probabilities?: Record<string, number>;
-    };
+type JevAnswer = { type?: 'noul'; noul: number };
 
 type JevResponse = {
   answers?: Record<string, JevAnswer>;
@@ -147,7 +114,6 @@ function optionString(
 }
 
 function resolveConfig(options: PluginOptions | ModConfig): ResolvedConfig {
-  const protectedKinds = options.protectedKinds;
   return {
     apiKey:
       typeof options.apiKey === 'string' && options.apiKey.length > 0
@@ -158,17 +124,10 @@ function resolveConfig(options: PluginOptions | ModConfig): ResolvedConfig {
       'dropThreshold',
       DEFAULTS.dropThreshold,
     ),
-    minKindConfidence: optionNumber(
+    protectThreshold: optionNumber(
       options,
-      'minKindConfidence',
-      DEFAULTS.minKindConfidence,
-    ),
-    protectedKinds: new Set(
-      Array.isArray(protectedKinds)
-        ? protectedKinds.filter((kind): kind is Kind =>
-            Object.prototype.hasOwnProperty.call(KIND_CRITERIA, kind),
-          )
-        : DEFAULTS.protectedKinds,
+      'protectThreshold',
+      DEFAULTS.protectThreshold,
     ),
     preserveRecentMessages: Math.max(
       0,
@@ -229,11 +188,20 @@ function toolPreview(tool: ToolUseSummary, limit: number): string {
   return `${tool.tool}: ${truncate(input, limit)}`;
 }
 
+function resultPreview(result: ToolResultSummary, limit: number): string {
+  const status = result.isError ? 'error' : 'ok';
+  return `${status} ${result.text.length} chars: ${truncate(result.text, limit)}`;
+}
+
 function unitPreview(messages: readonly SessionMessage[], limit: number): string {
   const roles = messages.map((message) => message.role).join('+');
   const tools = messages
     .flatMap((message) => message.toolUses)
     .map((tool) => toolPreview(tool, limit))
+    .join('; ');
+  const results = messages
+    .flatMap((message) => message.toolResults ?? [])
+    .map((result) => resultPreview(result, limit))
     .join('; ');
   const text = truncate(
     messages
@@ -242,7 +210,7 @@ function unitPreview(messages: readonly SessionMessage[], limit: number): string
       .join('\n'),
     limit,
   );
-  return `role=${roles}; tools=${tools || '(none)'}; text=${text}`;
+  return `role=${roles}; tools=${tools || '(none)'}; results=${results || '(none)'}; text=${text}`;
 }
 
 export function groupMessages(
@@ -304,39 +272,25 @@ export function packWindows(
   return windows;
 }
 
+const UNANSWERED: UnitAnswer = { drop: 0, protect: 0 };
+
 export function decideUnit(
   unit: Pick<CompactionUnit, 'id' | 'pinned'>,
-  answer: { drop: number; kind: Kind; kindConfidence: number },
-  config: Pick<ResolvedConfig, 'dropThreshold' | 'minKindConfidence' | 'protectedKinds'>,
+  answer: UnitAnswer,
+  config: Pick<ResolvedConfig, 'dropThreshold' | 'protectThreshold'>,
 ): UnitDecision {
   if (unit.pinned) {
-    return {
-      id: unit.id,
-      drop: 0,
-      kind: 'other',
-      kindConfidence: 0,
-      action: 'keep',
-      reason: 'pinned',
-    };
+    return { id: unit.id, ...UNANSWERED, action: 'keep', reason: 'pinned' };
   }
   const decision: UnitDecision = {
     id: unit.id,
-    drop: answer.drop,
-    kind: answer.kind,
-    kindConfidence: answer.kindConfidence,
+    ...answer,
     action: 'keep',
     reason: 'below_threshold',
   };
-  if (
-    config.protectedKinds.has(answer.kind) &&
-    answer.kindConfidence >= config.minKindConfidence
-  ) {
-    decision.reason = 'protected_kind';
-  } else if (answer.drop < config.dropThreshold) {
-    decision.reason = 'below_threshold';
-  } else if (answer.kindConfidence < config.minKindConfidence) {
-    decision.reason = 'low_confidence';
-  } else {
+  if (answer.protect >= config.protectThreshold) {
+    decision.reason = 'protected';
+  } else if (answer.drop >= config.dropThreshold) {
     decision.action = 'drop';
     decision.reason = 'dropped';
   }
@@ -380,43 +334,35 @@ function questionsFor(units: readonly CompactionUnit[]): Record<string, unknown>
         `drop_${unit.id}`,
         {
           type: 'noul',
-          instructions: `Unit ${unit.id} can be removed from the conversation without losing information the assistant needs to continue the current task`,
+          instructions: `Unit ${unit.id} can be deleted without losing anything the assistant still needs`,
         },
       ],
       [
-        `kind_${unit.id}`,
+        `protect_${unit.id}`,
         {
-          type: 'choice',
-          instructions: `What kind of information is in unit ${unit.id}?`,
-          criteria: KIND_CRITERIA,
+          type: 'noul',
+          instructions: `Unit ${unit.id} is where the user states a standing rule, constraint, or preference for the assistant to keep following, or names work that has still not been done`,
         },
       ],
     ]),
   );
 }
 
+function noul(answers: Record<string, JevAnswer>, name: string): number {
+  const answer = answers[name];
+  if (!answer || typeof answer.noul !== 'number') {
+    throw new Error(`Invalid Jev answer for ${name}`);
+  }
+  return answer.noul;
+}
+
 function answerFor(
   answers: Record<string, JevAnswer>,
   unit: CompactionUnit,
-): { drop: number; kind: Kind; kindConfidence: number } {
-  const dropAnswer = answers[`drop_${unit.id}`];
-  const kindAnswer = answers[`kind_${unit.id}`];
-  if (
-    !dropAnswer ||
-    !('noul' in dropAnswer) ||
-    typeof dropAnswer.noul !== 'number' ||
-    !kindAnswer ||
-    !('choice' in kindAnswer) ||
-    typeof kindAnswer.choice !== 'string' ||
-    !(kindAnswer.choice in KIND_CRITERIA) ||
-    typeof kindAnswer.confidence !== 'number'
-  ) {
-    throw new Error(`Invalid Jev answers for ${unit.id}`);
-  }
+): UnitAnswer {
   return {
-    drop: dropAnswer.noul,
-    kind: kindAnswer.choice as Kind,
-    kindConfidence: kindAnswer.confidence,
+    drop: noul(answers, `drop_${unit.id}`),
+    protect: noul(answers, `protect_${unit.id}`),
   };
 }
 
@@ -436,6 +382,7 @@ async function askWindow(
     body: JSON.stringify({
       model: config.model,
       state: {
+        context: COMPACTION_CONTEXT,
         goal,
         window: window.map((unit) => ({
           id: unit.id,
@@ -456,11 +403,7 @@ async function askWindow(
       const answer = answerFor(parsed.answers as Record<string, JevAnswer>, unit);
       return [
         unit.id,
-        decideUnit(unit, answer, {
-          dropThreshold: config.dropThreshold,
-          minKindConfidence: config.minKindConfidence,
-          protectedKinds: config.protectedKinds,
-        }),
+        decideUnit(unit, answer, config),
       ];
     }),
   );
@@ -484,9 +427,7 @@ export async function compactWithFetch(
   if (candidates.length === 0) {
     return {
       messages: [...messages],
-      decisions: units.map((unit) =>
-        decideUnit(unit, { drop: 0, kind: 'other', kindConfidence: 0 }, config),
-      ),
+      decisions: units.map((unit) => decideUnit(unit, UNANSWERED, config)),
       charsBefore: messages.reduce((sum, message) => sum + messageChars(message), 0),
       charsAfter: messages.reduce((sum, message) => sum + messageChars(message), 0),
     };
@@ -498,10 +439,7 @@ export async function compactWithFetch(
   const byId = new Map(results.flatMap((result) => [...result.entries()]));
   const decisions = units.map((unit) => {
     const decision = byId.get(unit.id);
-    return (
-      decision ??
-      decideUnit(unit, { drop: 0, kind: 'other', kindConfidence: 0 }, config)
-    );
+    return decision ?? decideUnit(unit, UNANSWERED, config);
   });
   const dropped = new Set(
     decisions
@@ -518,29 +456,45 @@ export async function compactWithFetch(
   };
 }
 
+export function reductionRatio(result: CompactionOutput): number {
+  return result.charsBefore === 0
+    ? 0
+    : (result.charsBefore - result.charsAfter) / result.charsBefore;
+}
+
 export async function compactOrFallback(
   messages: readonly SessionMessage[],
   options: ModConfig = {},
   fetchFn: HookFetch,
 ): Promise<CompactionOutput | null> {
   const result = await compactWithFetch(messages, options, fetchFn);
-  const reduction =
-    result.charsBefore === 0
-      ? 0
-      : (result.charsBefore - result.charsAfter) / result.charsBefore;
-  return reduction < (options.minReductionRatio ?? DEFAULTS.minReductionRatio)
+  return reductionRatio(result) <
+    (options.minReductionRatio ?? DEFAULTS.minReductionRatio)
     ? null
     : result;
+}
+
+function percent(ratio: number): string {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function summarize(result: CompactionOutput): string {
+  const counts = new Map<UnitDecision['reason'], number>();
+  for (const decision of result.decisions) {
+    counts.set(decision.reason, (counts.get(decision.reason) ?? 0) + 1);
+  }
+  const parts = [...counts.entries()].map(([reason, count]) => `${count} ${reason}`);
+  return `${percent(reductionRatio(result))} reduction; ${parts.join(', ')}`;
 }
 
 function optionConfig(options: PluginOptions): ModConfig {
   return {
     apiKey: typeof options.apiKey === 'string' && options.apiKey.length > 0 ? options.apiKey : undefined,
     dropThreshold: optionNumber(options, 'dropThreshold', DEFAULTS.dropThreshold),
-    minKindConfidence: optionNumber(
+    protectThreshold: optionNumber(
       options,
-      'minKindConfidence',
-      DEFAULTS.minKindConfidence,
+      'protectThreshold',
+      DEFAULTS.protectThreshold,
     ),
     preserveRecentMessages: optionNumber(
       options,
@@ -581,7 +535,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const apiKey = await getApiKey($, configured);
-      const result = await compactOrFallback(
+      const result = await compactWithFetch(
         event.messages,
         { ...configured, apiKey },
         async (url, init) => {
@@ -593,12 +547,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
           };
         },
       );
-      if (!result) {
+      const minReduction =
+        configured.minReductionRatio ?? DEFAULTS.minReductionRatio;
+      if (reductionRatio(result) < minReduction) {
         $.ui.log(
-          'fallback (reduction below minimum)',
+          `fallback (below ${percent(minReduction)} minimum: ${summarize(result)})`,
         );
         return next(event);
       }
+      $.ui.log(`kept ${result.messages.length}/${event.messages.length} messages (${summarize(result)})`);
       return { messages: result.messages };
     } catch (error) {
       $.ui.log(

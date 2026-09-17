@@ -84,37 +84,21 @@ describe('Claude Code mod pure logic', () => {
   });
 
   it('applies the requested decision matrix', () => {
-    const config = {
-      dropThreshold: 0.8,
-      minKindConfidence: 0.5,
-      protectedKinds: new Set(['user_instruction' as const]),
-    };
+    const config = { dropThreshold: 0.8, protectThreshold: 0.7 };
     const unit = { id: 'unit-1', pinned: false };
-    expect(decideUnit(unit, {
-      drop: 0.99,
-      kind: 'user_instruction',
-      kindConfidence: 0.9,
-    }, config).reason).toBe('protected_kind');
-    expect(decideUnit(unit, {
-      drop: 0.2,
-      kind: 'other',
-      kindConfidence: 0.9,
-    }, config).reason).toBe('below_threshold');
-    expect(decideUnit(unit, {
-      drop: 0.9,
-      kind: 'other',
-      kindConfidence: 0.2,
-    }, config).reason).toBe('low_confidence');
-    expect(decideUnit(unit, {
-      drop: 0.9,
-      kind: 'other',
-      kindConfidence: 0.9,
-    }, config).action).toBe('drop');
-    expect(decideUnit({ id: 'unit-0', pinned: true }, {
-      drop: 1,
-      kind: 'other',
-      kindConfidence: 1,
-    }, config).reason).toBe('pinned');
+    expect(decideUnit(unit, { drop: 0.99, protect: 0.9 }, config).reason).toBe(
+      'protected',
+    );
+    expect(decideUnit(unit, { drop: 0.2, protect: 0.1 }, config).reason).toBe(
+      'below_threshold',
+    );
+    expect(decideUnit(unit, { drop: 0.9, protect: 0.69 }, config).action).toBe(
+      'drop',
+    );
+    expect(
+      decideUnit({ id: 'unit-0', pinned: true }, { drop: 1, protect: 0 }, config)
+        .reason,
+    ).toBe('pinned');
   });
 
   it('falls back when the estimated reduction is too small', async () => {
@@ -136,9 +120,7 @@ describe('Claude Code mod pure logic', () => {
         const answers = Object.fromEntries(
           Object.keys(body.questions).map((key) => [
             key,
-            key.startsWith('drop_')
-              ? { type: 'noul', noul: 0.1 }
-              : { type: 'choice', choice: 'other', confidence: 0.9 },
+            { type: 'noul', noul: key.startsWith('drop_') ? 0.1 : 0.2 },
           ]),
         );
         return { status: 200, ok: true, text: JSON.stringify({ answers }) };
