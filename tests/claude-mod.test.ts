@@ -245,6 +245,7 @@ describe('Claude Code mod pure logic', () => {
     expect(returnedResult?.toolResults?.[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
     );
+    expect(result.truncatedResults).toBe(1);
     expect(result.charsAfter).toBeLessThan(result.charsBefore);
 
     const shortResult = message('user', '', {
@@ -263,5 +264,6 @@ describe('Claude Code mod pure logic', () => {
       (candidate) => candidate.handle === 'h-short',
     );
     expect(unchanged).toBe(shortResult);
+    expect(short.truncatedResults).toBe(0);
   });
 });

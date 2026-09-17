@@ -604,7 +604,25 @@ export type CompactionOutput = {
   decisions: UnitDecision[];
   charsBefore: number;
   charsAfter: number;
+  truncatedResults: number;
 };
+
+function countTruncatedResults(
+  original: readonly SessionMessage[],
+  rebuilt: readonly SessionMessage[],
+): number {
+  let count = 0;
+  for (let index = 0; index < original.length; index += 1) {
+    const originalResults = original[index]?.toolResults ?? [];
+    const rebuiltResults = rebuilt[index]?.toolResults ?? [];
+    for (let resultIndex = 0; resultIndex < originalResults.length; resultIndex += 1) {
+      if (originalResults[resultIndex]?.text !== rebuiltResults[resultIndex]?.text) {
+        count += 1;
+      }
+    }
+  }
+  return count;
+}
 
 export async function compactWithFetch(
   messages: readonly SessionMessage[],
@@ -622,6 +640,7 @@ export async function compactWithFetch(
       ),
       charsBefore: messages.reduce((sum, message) => sum + messageChars(message), 0),
       charsAfter: messages.reduce((sum, message) => sum + messageChars(message), 0),
+      truncatedResults: 0,
     };
   }
   const windows = packWindows(candidates, config.maxWindowChars);
@@ -637,11 +656,14 @@ export async function compactWithFetch(
     );
   });
   const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
+  let truncatedResults = 0;
   const kept = units.flatMap((unit) => {
     const decision = decisionById.get(unit.id);
     if (decision?.action === 'drop') return [];
     if (decision?.action === 'truncate') {
-      return truncateToolResults(unit.messages, config.truncateHeadChars);
+      const rebuilt = truncateToolResults(unit.messages, config.truncateHeadChars);
+      truncatedResults += countTruncatedResults(unit.messages, rebuilt);
+      return rebuilt;
     }
     return unit.messages;
   });
@@ -650,6 +672,7 @@ export async function compactWithFetch(
     decisions,
     charsBefore: messages.reduce((sum, message) => sum + messageChars(message), 0),
     charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+    truncatedResults,
   };
 }
 
@@ -760,7 +783,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
         },
       );
       const dropped = result.decisions.filter((d) => d.action === 'drop').length;
-      const truncated = result.decisions.filter((d) => d.action === 'truncate').length;
       const pct = result.charsBefore === 0 ? 0 : Math.round((1 - result.charsAfter / result.charsBefore) * 100);
       $.ui.log(
         `decisions: ${result.decisions
@@ -774,13 +796,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (reduction < (config.minReductionRatio ?? DEFAULTS.minReductionRatio)) {
         notify(
           $,
-          `fallback to built-in summary (truncated ${truncated} tool results, dropped ${dropped}/${result.decisions.length} units, -${pct}% chars, below minimum)`,
+          `fallback to built-in summary (truncated ${result.truncatedResults} tool results, dropped ${dropped}/${result.decisions.length} units, -${pct}% chars, below minimum)`,
         );
         return next(event);
       }
       notify(
         $,
-        `kept ${result.messages.length}/${event.messages.length} messages, truncated ${truncated} tool results, dropped ${dropped} units (-${pct}% chars, no summary)`,
+        `kept ${result.messages.length}/${event.messages.length} messages, truncated ${result.truncatedResults} tool results, dropped ${dropped} units (-${pct}% chars, no summary)`,
       );
       return { messages: result.messages };
     } catch (error) {
