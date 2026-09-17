@@ -84,7 +84,11 @@ describe('Claude Code mod pure logic', () => {
   });
 
   it('applies the requested decision matrix', () => {
-    const config = { dropThreshold: 0.8, protectThreshold: 0.7 };
+    const config = {
+      dropThreshold: 0.8,
+      toolOutputDropThreshold: 0.5,
+      protectThreshold: 0.7,
+    };
     const unit = { id: 'unit-1', pinned: false };
     expect(decideUnit(unit, { drop: 0.99, protect: 0.9 }, config).reason).toBe(
       'protected',
@@ -95,6 +99,13 @@ describe('Claude Code mod pure logic', () => {
     expect(decideUnit(unit, { drop: 0.9, protect: 0.69 }, config).action).toBe(
       'drop',
     );
+    expect(decideUnit(unit, { drop: 0.6, protect: 0.1 }, config).action).toBe(
+      'keep',
+    );
+    expect(
+      decideUnit({ ...unit, toolOutput: true }, { drop: 0.6, protect: 0.1 }, config)
+        .action,
+    ).toBe('drop');
     expect(
       decideUnit({ id: 'unit-0', pinned: true }, { drop: 1, protect: 0 }, config)
         .reason,

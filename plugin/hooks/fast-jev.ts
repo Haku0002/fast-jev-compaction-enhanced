@@ -10,6 +10,7 @@ import type {
 
 const DEFAULTS = {
   dropThreshold: 0.8,
+  toolOutputDropThreshold: 0.5,
   protectThreshold: 0.7,
   preserveRecentMessages: 6,
   compactAtPercent: 60,
@@ -45,6 +46,7 @@ export type CompactionUnit = {
   id: string;
   messages: SessionMessage[];
   pinned: boolean;
+  toolOutput: boolean;
   preview: string;
 };
 
@@ -62,6 +64,7 @@ export type UnitDecision = UnitAnswer & {
 export type ModConfig = {
   apiKey?: string;
   dropThreshold?: number;
+  toolOutputDropThreshold?: number;
   protectThreshold?: number;
   preserveRecentMessages?: number;
   compactAtPercent?: number;
@@ -75,6 +78,7 @@ export type ModConfig = {
 type ResolvedConfig = {
   apiKey?: string;
   dropThreshold: number;
+  toolOutputDropThreshold: number;
   protectThreshold: number;
   preserveRecentMessages: number;
   compactAtPercent: number;
@@ -123,6 +127,11 @@ function resolveConfig(options: PluginOptions | ModConfig): ResolvedConfig {
       options,
       'dropThreshold',
       DEFAULTS.dropThreshold,
+    ),
+    toolOutputDropThreshold: optionNumber(
+      options,
+      'toolOutputDropThreshold',
+      DEFAULTS.toolOutputDropThreshold,
     ),
     protectThreshold: optionNumber(
       options,
@@ -210,7 +219,12 @@ function unitPreview(messages: readonly SessionMessage[], limit: number): string
       .join('\n'),
     limit,
   );
-  return `role=${roles}; tools=${tools || '(none)'}; results=${results || '(none)'}; text=${text}`;
+  const chars = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  return `role=${roles}; chars=${chars}; tools=${tools || '(none)'}; results=${results || '(none)'}; text=${text}`;
+}
+
+function hasToolOutput(messages: readonly SessionMessage[]): boolean {
+  return messages.some((message) => (message.toolResults ?? []).length > 0);
 }
 
 export function groupMessages(
@@ -244,6 +258,7 @@ export function groupMessages(
       id: `unit-${index}`,
       messages: grouped,
       pinned: index === 0 || end >= recentStart,
+      toolOutput: hasToolOutput(grouped),
       preview: unitPreview(grouped, previewChars),
     });
     index = end;
@@ -275,9 +290,13 @@ export function packWindows(
 const UNANSWERED: UnitAnswer = { drop: 0, protect: 0 };
 
 export function decideUnit(
-  unit: Pick<CompactionUnit, 'id' | 'pinned'>,
+  unit: Pick<CompactionUnit, 'id' | 'pinned'> &
+    Partial<Pick<CompactionUnit, 'toolOutput'>>,
   answer: UnitAnswer,
-  config: Pick<ResolvedConfig, 'dropThreshold' | 'protectThreshold'>,
+  config: Pick<
+    ResolvedConfig,
+    'dropThreshold' | 'toolOutputDropThreshold' | 'protectThreshold'
+  >,
 ): UnitDecision {
   if (unit.pinned) {
     return { id: unit.id, ...UNANSWERED, action: 'keep', reason: 'pinned' };
@@ -290,7 +309,10 @@ export function decideUnit(
   };
   if (answer.protect >= config.protectThreshold) {
     decision.reason = 'protected';
-  } else if (answer.drop >= config.dropThreshold) {
+  } else if (
+    answer.drop >=
+    (unit.toolOutput ? config.toolOutputDropThreshold : config.dropThreshold)
+  ) {
     decision.action = 'drop';
     decision.reason = 'dropped';
   }
@@ -491,6 +513,11 @@ function optionConfig(options: PluginOptions): ModConfig {
   return {
     apiKey: typeof options.apiKey === 'string' && options.apiKey.length > 0 ? options.apiKey : undefined,
     dropThreshold: optionNumber(options, 'dropThreshold', DEFAULTS.dropThreshold),
+    toolOutputDropThreshold: optionNumber(
+      options,
+      'toolOutputDropThreshold',
+      DEFAULTS.toolOutputDropThreshold,
+    ),
     protectThreshold: optionNumber(
       options,
       'protectThreshold',
@@ -522,10 +549,44 @@ function optionConfig(options: PluginOptions): ModConfig {
 }
 
 async function getApiKey(
-  $: { env: { get: (name: string) => Promise<string | undefined> } },
+  $: {
+    env: { get: (name: string) => Promise<string | undefined> };
+    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+  },
   config: ModConfig,
 ): Promise<string | undefined> {
-  return config.apiKey || (await $.env.get('TYPESAFE_API_KEY'));
+  if (config.apiKey) return config.apiKey;
+  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+  if (fromEnv) return fromEnv;
+  const settings = await $.settings.read();
+  const env = settings['env'];
+  if (env && typeof env === 'object') {
+    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    if (typeof value === 'string' && value) return value;
+  }
+  return undefined;
+}
+
+function notify(
+  $: {
+    ui: {
+      log: (text: string) => void;
+      toast: (text: string, options?: { timeoutMs?: number }) => void;
+    };
+  },
+  text: string,
+): void {
+  $.ui.log(text);
+  $.ui.toast(text, { timeoutMs: 15_000 });
+}
+
+function decisionLog(result: CompactionOutput): string {
+  return result.decisions
+    .map(
+      (d) =>
+        `${d.id}:${d.action[0]}/${d.reason}/drop=${d.drop.toFixed(2)}/protect=${d.protect.toFixed(2)}`,
+    )
+    .join(' ');
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -547,19 +608,25 @@ export const register: Register = (on: On, options: PluginOptions) => {
           };
         },
       );
+      $.ui.log(`decisions: ${decisionLog(result)}`);
       const minReduction =
         configured.minReductionRatio ?? DEFAULTS.minReductionRatio;
       if (reductionRatio(result) < minReduction) {
-        $.ui.log(
-          `fallback (below ${percent(minReduction)} minimum: ${summarize(result)})`,
+        notify(
+          $,
+          `fallback to built-in summary (below ${percent(minReduction)} minimum: ${summarize(result)})`,
         );
         return next(event);
       }
-      $.ui.log(`kept ${result.messages.length}/${event.messages.length} messages (${summarize(result)})`);
+      notify(
+        $,
+        `kept ${result.messages.length}/${event.messages.length} messages verbatim, no summary (${summarize(result)})`,
+      );
       return { messages: result.messages };
     } catch (error) {
-      $.ui.log(
-        `fallback (${error instanceof Error ? error.message : String(error)})`,
+      notify(
+        $,
+        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
       return next(event);
     }
