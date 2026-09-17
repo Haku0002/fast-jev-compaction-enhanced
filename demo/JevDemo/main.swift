@@ -156,18 +156,18 @@ final class Demo: ObservableObject {
             let dropped = transcript.filter { $0.verdict.isDrop }
             status = "\(dropped.count) to drop · \(transcript.count - dropped.count) to keep"
 
-            try await clock.sleep(until: start + .seconds(3.15))
+            try await clock.sleep(until: start + .seconds(3.05))
             phase = .collapsing
             status = "Removing clutter…"
-            withAnimation(.easeInOut(duration: 0.65)) {
+            withAnimation(.easeInOut(duration: 0.85)) {
                 dropProgress = 1
                 tokens = DemoTokens.after
             }
-            try await clock.sleep(until: start + .seconds(3.8))
+            try await clock.sleep(until: start + .seconds(3.9))
             withAnimation(.easeInOut(duration: 0.4)) {
                 visible.removeAll { $0.verdict.isDrop }
             }
-            try await clock.sleep(until: start + .seconds(4.25))
+            try await clock.sleep(until: start + .seconds(4.35))
             phase = .done
             status = "Context compacted"
             summary = "\(transcript.count - dropped.count) kept verbatim · \(dropped.count) removed"
@@ -274,10 +274,69 @@ struct TokenCounter: View, Animatable {
     }
 
     var body: some View {
-        Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
-            .font(.system(size: 64, weight: .semibold, design: .monospaced))
-            .monospacedDigit()
-            .foregroundStyle(Palette.fg)
+        let saved = max(0, 1 - value / DemoTokens.before)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("CONTEXT TOKENS")
+                    .font(.system(size: 11, weight: .semibold))
+                    .tracking(2)
+                    .foregroundStyle(Palette.dim)
+                Spacer()
+                Text("fast-jev-compaction")
+                    .font(monoSmall)
+                    .foregroundStyle(Palette.cyan)
+            }
+            HStack(alignment: .center) {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
+                        .font(.system(size: 54, weight: .medium, design: .rounded))
+                        .tracking(-1.5)
+                        .monospacedDigit()
+                        .foregroundStyle(Palette.fg)
+                    Text("/ 200k")
+                        .font(.system(size: 18, weight: .regular, design: .rounded))
+                        .foregroundStyle(Palette.dim)
+                }
+                Spacer()
+                HStack(spacing: 7) {
+                    Image(systemName: "arrow.down.right")
+                    Text(saved.formatted(.percent.precision(.fractionLength(1))))
+                        .monospacedDigit()
+                    Text("less")
+                }
+                .font(.system(size: 16, weight: .semibold, design: .rounded))
+                .foregroundStyle(Palette.green)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(Capsule().fill(Palette.green.opacity(0.12)))
+                .overlay(Capsule().stroke(Palette.green.opacity(0.25), lineWidth: 1))
+                .opacity(min(1, saved * 15))
+            }
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Palette.border.opacity(0.7))
+                    Capsule()
+                        .fill(LinearGradient(
+                            colors: [Palette.cyan, Palette.green],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        ))
+                        .frame(width: geometry.size.width * value / DemoTokens.capacity)
+                }
+            }
+            .frame(height: 4)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(LinearGradient(
+                    colors: [Palette.panel, Palette.bg],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ))
+        )
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Palette.border, lineWidth: 1))
     }
 }
 
@@ -312,9 +371,9 @@ struct TerminalView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            tokenHeader
+            TokenCounter(value: demo.tokens)
                 .padding(.horizontal, 20)
-                .padding(.vertical, 18)
+                .padding(.vertical, 12)
 
             GeometryReader { container in
                 VStack(alignment: .leading, spacing: 3) {
@@ -369,24 +428,6 @@ struct TerminalView: View {
                 .shadow(color: Palette.cyan, radius: 8)
         }
         .allowsHitTesting(false)
-    }
-
-    var tokenHeader: some View {
-        HStack(alignment: .bottom) {
-            HStack(alignment: .firstTextBaseline, spacing: 14) {
-                TokenCounter(value: demo.tokens)
-                Text("TOKENS")
-                    .font(.system(size: 16, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Palette.dim)
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 6) {
-                Text("fast-jev-compaction").foregroundStyle(Palette.cyan)
-                Text("scripted demo").foregroundStyle(Palette.dim)
-            }
-            .font(monoSmall)
-            .padding(.bottom, 12)
-        }
     }
 
     var footer: some View {
