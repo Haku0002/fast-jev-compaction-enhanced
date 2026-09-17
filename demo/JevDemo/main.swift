@@ -95,7 +95,6 @@ struct ScrollRequest: Equatable {
 @MainActor
 final class Demo: ObservableObject {
     @Published var visible: [Chunk] = []
-    @Published var typed: [Int: Int] = [:]
     @Published var revealed: Set<Int> = []
     @Published var phase: Phase = .idle
     @Published var beamY: CGFloat? = nil
@@ -116,7 +115,6 @@ final class Demo: ObservableObject {
     func restart() {
         task?.cancel()
         visible = []
-        typed = [:]
         revealed = []
         beamY = nil
         context = 0.06
@@ -132,73 +130,54 @@ final class Demo: ObservableObject {
 
     private func run() async {
         do {
-            try await sleep(1.2)
+            try await sleep(0.4)
             phase = .typing
             let perChunk = 0.72 / Double(transcript.count)
             for chunk in transcript {
-                withAnimation(.spring(duration: 0.35)) {
+                withAnimation(.spring(duration: 0.25)) {
                     visible.append(chunk)
                     context += perChunk
                 }
                 scrollTo(chunk.id, anchor: .bottom)
-                switch chunk.role {
-                case .user, .assistant:
-                    typed[chunk.id] = 0
-                    let delay = chunk.role == .user ? 0.022 : 0.012
-                    for i in 1...chunk.text.count {
-                        typed[chunk.id] = i
-                        try await sleep(delay)
-                    }
-                    try await sleep(0.28)
-                case .toolHeader:
-                    try await sleep(0.32)
-                case .toolLine:
-                    try await sleep(0.11)
-                }
+                try await sleep(chunk.role == .toolLine ? 0.03 : 0.06)
             }
 
             phase = .waiting
             status = "Context window at \(Int(context * 100))% — running fast-jev-compaction"
-            try await sleep(1.6)
+            try await sleep(0.6)
 
             phase = .scanning
             let candidates = transcript.filter { !$0.recent }.count
             status = "✻ Asking jev-latest \(candidates * 2) questions (\(candidates) chunks × removable? + kind)…"
-            try await sleep(0.9)
+            try await sleep(0.3)
 
             for chunk in transcript {
                 scrollTo(chunk.id, anchor: nil)
-                try await sleep(0.02)
+                try await sleep(0.01)
                 if let f = frames[chunk.id] {
-                    withAnimation(.linear(duration: 0.09)) { beamY = f.maxY }
+                    withAnimation(.linear(duration: 0.05)) { beamY = f.maxY }
                 }
-                try await sleep(0.05)
-                withAnimation(.easeOut(duration: 0.25)) { _ = revealed.insert(chunk.id) }
-                try await sleep(0.07)
+                try await sleep(0.02)
+                withAnimation(.easeOut(duration: 0.2)) { _ = revealed.insert(chunk.id) }
+                try await sleep(0.03)
             }
-            try await sleep(0.4)
-            withAnimation(.easeOut(duration: 0.4)) { beamY = nil }
+            try await sleep(0.2)
+            withAnimation(.easeOut(duration: 0.3)) { beamY = nil }
             let dropped = transcript.filter { $0.verdict.isDrop }
             status = "\(dropped.count) chunks marked safe to drop · \(transcript.count - dropped.count) kept verbatim"
-            try await sleep(1.7)
+            try await sleep(0.7)
 
             phase = .collapsing
             status = "Deleting dropped chunks…"
             if let first = transcript.first { scrollTo(first.id, anchor: .top) }
-            try await sleep(0.5)
+            try await sleep(0.3)
             let charsBefore = transcript.reduce(0) { $0 + $1.text.count }
             let charsAfter = transcript.filter { !$0.verdict.isDrop }.reduce(0) { $0 + $1.text.count }
-            for chunk in dropped {
-                scrollTo(chunk.id, anchor: nil)
-                try await sleep(0.05)
-                withAnimation(.easeInOut(duration: 0.42)) {
-                    visible.removeAll { $0.id == chunk.id }
-                    context -= 0.72 / Double(transcript.count) * 1.35
-                }
-                try await sleep(0.24)
+            withAnimation(.easeInOut(duration: 0.55)) {
+                visible.removeAll { $0.verdict.isDrop }
+                context = 0.31
             }
-            try await sleep(0.4)
-            withAnimation(.spring(duration: 0.8)) { context = 0.31 }
+            try await sleep(0.7)
             phase = .done
             status = "✓ Compacted in 148 ms"
             summary = "\(transcript.count) chunks → \(transcript.count - dropped.count) kept · \(dropped.count) dropped · \(charsBefore) → \(charsAfter) chars · 1 request · 0 summaries · kept text is verbatim"
@@ -220,13 +199,9 @@ let monoSmall = Font.system(size: 12.5, design: .monospaced)
 
 struct ChunkView: View {
     let chunk: Chunk
-    let typedCount: Int?
     let revealed: Bool
 
-    var shownText: String {
-        if let n = typedCount { return String(chunk.text.prefix(n)) }
-        return chunk.text
-    }
+    var shownText: String { chunk.text }
 
     var tint: Color? {
         guard revealed else { return nil }
@@ -354,7 +329,6 @@ struct TerminalView: View {
                         ForEach(demo.visible) { chunk in
                             ChunkView(
                                 chunk: chunk,
-                                typedCount: demo.typed[chunk.id],
                                 revealed: demo.revealed.contains(chunk.id)
                             )
                             .id(chunk.id)
@@ -366,9 +340,7 @@ struct TerminalView: View {
                             })
                             .transition(.asymmetric(
                                 insertion: .move(edge: .bottom).combined(with: .opacity),
-                                removal: .scale(scale: 0.85, anchor: .leading)
-                                    .combined(with: .move(edge: .trailing))
-                                    .combined(with: .opacity)
+                                removal: .move(edge: .trailing).combined(with: .opacity)
                             ))
                         }
                     }
@@ -387,11 +359,6 @@ struct TerminalView: View {
                 .onChange(of: demo.scroll) { _, request in
                     if let request {
                         withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo(request.id, anchor: request.anchor) }
-                    }
-                }
-                .onChange(of: demo.typed) { _, _ in
-                    if let request = demo.scroll, demo.phase == .typing {
-                        proxy.scrollTo(request.id, anchor: .bottom)
                     }
                 }
             }
