@@ -295,7 +295,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const apiKey = await getApiKey($, configured);
         if (!apiKey) return answer;
         const goal = goalFromMessages(await $.session.messages());
-        const path = `.claude/fast-jev-compaction/bash-${event.tool_use_id ?? Date.now()}.txt`;
+        const home = await $.env.get('HOME');
+        const path = `${home ? `${home}/` : ''}.claude/fast-jev-compaction/bash-${event.tool_use_id ?? Date.now()}.txt`;
         await $.fs.write(path, combined);
         const trimmed = await trimOutput(
           {
