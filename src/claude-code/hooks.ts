@@ -87,10 +87,9 @@ function contextFor(
     let used = header.length;
     for (const { decision, chunk } of ordered) {
       const line = `- [${decision.kind}] (${chunk.role}) ${chunk.text}`;
-      const separator = lines.length ? 1 : 1;
-      if (used + separator + line.length > maxContextChars) continue;
+      if (used + 1 + line.length > maxContextChars) continue;
       lines.push(line);
-      used += separator + line.length;
+      used += 1 + line.length;
     }
     return lines.length ? `${header}\n${lines.join('\n')}` : header.slice(0, maxContextChars);
   });
