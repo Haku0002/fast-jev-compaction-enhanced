@@ -278,13 +278,19 @@ struct TokenCounter: View, Animatable {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
-                .font(.system(size: 32, weight: .medium, design: .monospaced))
-                .monospacedDigit()
-                .foregroundStyle(value < DemoTokens.before ? Palette.green : Palette.fg)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            ZStack(alignment: .trailing) {
+                Text(Int(DemoTokens.before).formatted(.number.locale(Locale(identifier: "en_US"))))
+                    .hidden()
+                    .accessibilityHidden(true)
+                Text(Int(value.rounded()).formatted(.number.locale(Locale(identifier: "en_US"))))
+            }
+            .font(.system(size: 44, weight: .semibold, design: .monospaced))
+            .tracking(-1.5)
+            .monospacedDigit()
+            .foregroundStyle(value < DemoTokens.before ? Palette.green : Palette.fg)
             Text("tokens")
-                .font(mono)
+                .font(monoSmall)
                 .foregroundStyle(Palette.dim)
         }
         .fixedSize()
@@ -322,21 +328,26 @@ struct TerminalView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(spacing: 14) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("✻").foregroundStyle(Palette.orange)
-                    Text("fast-jev-compaction").foregroundStyle(Palette.dim)
+            VStack(spacing: 16) {
+                HStack(alignment: .center) {
+                    HStack(spacing: 14) {
+                        Text("✻")
+                            .font(.system(size: 30, design: .monospaced))
+                            .foregroundStyle(Palette.orange)
+                        TokenCounter(value: demo.tokens)
+                    }
                     Spacer()
-                    TokenCounter(value: demo.tokens)
+                    Text("fast-jev-compaction")
+                        .font(monoSmall)
+                        .foregroundStyle(Palette.dim)
                 }
-                .font(mono)
                 Rectangle()
                     .fill(Palette.border.opacity(0.6))
                     .frame(height: 1)
             }
             .padding(.horizontal, 20)
-            .padding(.top, 18)
-            .padding(.bottom, 10)
+            .padding(.top, 20)
+            .padding(.bottom, 12)
 
             GeometryReader { container in
                 VStack(alignment: .leading, spacing: 3) {
