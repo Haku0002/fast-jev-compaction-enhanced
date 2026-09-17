@@ -267,6 +267,16 @@ async function getApiKey(
   return undefined;
 }
 
+const SECRET_COMMAND =
+  /(^|[|;&]\s*)(printenv|env)\b|\.env\b|\b(secret|secrets|credential|credentials|password|token|keychain|netrc|id_rsa|private[_-]?key)\b/i;
+const SECRET_OUTPUT =
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(aws_secret_access_key|api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[=:]\s*\S|:\/\/[^\s:@/]+:[^\s:@/]+@/i;
+
+/** True when the command or its output looks like it carries credentials. */
+export function looksSecret(command: string, output: string): boolean {
+  return SECRET_COMMAND.test(command) || SECRET_OUTPUT.test(output.slice(0, 20_000));
+}
+
 function notify(
   $: {
     ui: {
@@ -295,10 +305,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const apiKey = await getApiKey($, configured);
         if (!apiKey) return answer;
         const goal = goalFromMessages(await $.session.messages());
-        const path = `.claude/fast-jev-compaction/bash-${event.tool_use_id ?? Date.now()}.txt`;
-        const ignorePath = '.claude/fast-jev-compaction/.gitignore';
-        if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
-        await $.fs.write(path, combined);
+        // Secrets are never written to disk; such output is still trimmed, but
+        // the marker tells the agent to re-run the command instead of pointing
+        // at a file that would outlive the session.
+        const secret = looksSecret(event.command, combined);
+        const path = secret
+          ? undefined
+          : `.claude/fast-jev-compaction/bash-${event.tool_use_id ?? Date.now()}.txt`;
         const trimmed = await trimOutput(
           {
             command: event.command,
@@ -322,6 +335,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
           },
         );
         if (!trimmed.trimmed) return answer;
+        // Written only now, so output that ends up untrimmed leaves nothing behind.
+        if (path) {
+          const ignorePath = '.claude/fast-jev-compaction/.gitignore';
+          if (!(await $.fs.exists(ignorePath))) await $.fs.write(ignorePath, '*\n');
+          await $.fs.write(path, combined);
+        }
         const scores = trimmed.scores.map((score) => score.toFixed(2)).join(',');
         $.ui.log(
           `bash output: kept ${trimmed.kept}/${trimmed.chunks} chunks (${trimmed.charsBefore}→${trimmed.charsAfter} chars) scores=${scores}`,

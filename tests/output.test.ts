@@ -133,3 +133,54 @@ describe('Bash output hook options', () => {
     });
   });
 });
+
+describe('trimOutput safety', () => {
+  const asker = (score: number) => ({
+    ask: async (_state: unknown, questions: Record<string, unknown>) => ({
+      answers: Object.fromEntries(
+        Object.keys(questions).map((id) => [id, { type: 'noul' as const, noul: score }]),
+      ),
+    }),
+  });
+  const lines = (n: number, make: (i: number) => string) =>
+    Array.from({ length: n }, (_, i) => make(i)).join('\n');
+
+  it('leaves a JSON document alone', async () => {
+    const json = JSON.stringify({ items: Array.from({ length: 400 }, (_, i) => ({ i })) }, null, 2);
+    const r = await trimOutput({ command: 'cat items.json', goal: 'g', output: json }, asker(0));
+    expect(r.trimmed).toBe(false);
+    expect(r.output).toBe(json);
+  });
+
+  it('leaves binary output alone', async () => {
+    const bin = Array.from({ length: 9000 }, (_, i) => String.fromCharCode(i % 256)).join('');
+    const r = await trimOutput({ command: 'run', goal: 'g', output: bin }, asker(0));
+    expect(r.trimmed).toBe(false);
+  });
+
+  it('keeps a chunk that looks like an error even when Jev says drop', async () => {
+    const out = lines(400, (i) => (i === 200 ? 'ERROR: boom' : `[${i}] compiled module ${i} fine`));
+    const r = await trimOutput({ command: 'npm run build', goal: 'g', output: out }, asker(0));
+    expect(r.trimmed).toBe(true);
+    expect(r.output).toContain('ERROR: boom');
+  });
+
+  it('keeps chunks that were never scored instead of dropping them', async () => {
+    const out = lines(6000, (i) => `[${i}] ${'detail '.repeat(20)}`);
+    const r = await trimOutput(
+      { command: 'npm run build', goal: 'g', output: out },
+      asker(0),
+      { maxStateTokens: 1_000 },
+    );
+    expect(r.output).toContain('[3000]');
+  });
+
+  it('splits one enormous line so it can still be trimmed', async () => {
+    const r = await trimOutput(
+      { command: 'run', goal: 'g', output: 'x'.repeat(60_000) },
+      asker(0),
+      { chunkLines: 5 },
+    );
+    expect(r.chunks).toBeGreaterThan(2);
+  });
+});

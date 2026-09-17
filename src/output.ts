@@ -8,6 +8,11 @@ const DEFAULT_KEEP_THRESHOLD = 0.5;
 const DEFAULT_MAX_STATE_TOKENS = 25_000;
 const MAX_REQUEST_TOKENS = 30_000;
 
+const MAX_CHUNKS = 200;
+const MAX_LINE_CHARS = 2_000;
+const ERROR_PATTERN =
+  /\b(error|errors|failed|failure|fatal|exception|traceback|panic|assert|denied|refused|timeout|cannot|unable|warning)\b/i;
+
 const OUTPUT_CONTEXT =
   'A coding agent ran a shell command. Its output is split into numbered chunks. The agent will only see the chunks that are kept; the full output is saved to a file it can read later. Decide which chunks the agent needs to understand the outcome of the command and continue its task: errors, failures, warnings, summaries, final results, and lines the task depends on are needed; repetitive progress output, verbose listings, download/install noise and boilerplate are not.';
 
@@ -47,8 +52,55 @@ function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/** Output with NULs or a lot of control bytes is not text worth chunking. */
+export function looksBinary(output: string): boolean {
+  const sample = output.slice(0, 4_000);
+  if (sample.includes('\u0000')) return true;
+  let control = 0;
+  for (const char of sample) {
+    const code = char.charCodeAt(0);
+    if (code < 9 || (code > 13 && code < 32) || code === 127) control += 1;
+  }
+  return control > sample.length * 0.05;
+}
+
+/**
+ * Output the agent is likely to parse as one document (a file dump, a diff, a
+ * JSON blob). Cutting a hole in it leaves something that still looks complete
+ * but is not, so it is left alone.
+ */
+export function looksStructured(command: string, output: string): boolean {
+  const head = output.trimStart();
+  if (head.startsWith('{') || head.startsWith('[')) {
+    try {
+      JSON.parse(output);
+      return true;
+    } catch {
+      /* not JSON after all */
+    }
+  }
+  if (head.startsWith('<?xml') || head.startsWith('<!DOCTYPE') || head.startsWith('---\n')) return true;
+  if (/^diff --git |^--- |^@@ /m.test(output)) return true;
+  return /(^|[|;&]\s*)(cat|bat|jq|yq|git\s+(diff|show)|base64|openssl)\b/.test(command);
+}
+
+/** Splits over-long lines so one line cannot become an untrimmable chunk. */
+function splitLongLines(output: string): string[] {
+  const out: string[] = [];
+  for (const line of output.split('\n')) {
+    if (line.length <= MAX_LINE_CHARS) {
+      out.push(line);
+      continue;
+    }
+    for (let at = 0; at < line.length; at += MAX_LINE_CHARS) {
+      out.push(line.slice(at, at + MAX_LINE_CHARS));
+    }
+  }
+  return out;
+}
+
 function chunkOutput(output: string, chunkLines: number): OutputChunk[] {
-  const lines = output.split('\n');
+  const lines = splitLongLines(output);
   const chunks: OutputChunk[] = [];
   for (let start = 0; start < lines.length; start += chunkLines) {
     const text = lines.slice(start, start + chunkLines).join('\n');
@@ -123,8 +175,23 @@ function outputMarker(
   const chars =
     chunks.reduce((sum, chunk) => sum + chunk.chars, 0) + Math.max(0, chunks.length - 1);
   return `[fast-jev-compaction trimmed ${lines} lines (${chars} chars)${
-    fullOutputPath ? `; full output: ${fullOutputPath} (Read or grep it if needed)` : ''
+    fullOutputPath
+      ? `; full output: ${fullOutputPath} (Read or grep it if needed)`
+      : '; not saved to disk, re-run the command if you need these lines'
   }]`;
+}
+
+function untrimmed(output: string, chunks: number, scores: number[]): TrimOutputResult {
+  return {
+    output,
+    trimmed: false,
+    chunks,
+    kept: chunks,
+    dropped: 0,
+    charsBefore: output.length,
+    charsAfter: output.length,
+    scores,
+  };
 }
 
 export async function trimOutput(
@@ -143,32 +210,16 @@ export async function trimOutput(
     finite(options.maxStateTokens, DEFAULT_MAX_STATE_TOKENS),
   );
 
-  if (input.output.length <= minChars) {
-    return {
-      output: input.output,
-      trimmed: false,
-      chunks: 0,
-      kept: 0,
-      dropped: 0,
-      charsBefore: input.output.length,
-      charsAfter: input.output.length,
-      scores: [],
-    };
+  if (input.output.length <= minChars) return untrimmed(input.output, 0, []);
+
+  if (looksBinary(input.output) || looksStructured(input.command, input.output)) {
+    return untrimmed(input.output, 0, []);
   }
 
-  const chunks = chunkOutput(input.output, chunkLines);
-  if (chunks.length <= 2) {
-    return {
-      output: input.output,
-      trimmed: false,
-      chunks: chunks.length,
-      kept: chunks.length,
-      dropped: 0,
-      charsBefore: input.output.length,
-      charsAfter: input.output.length,
-      scores: [],
-    };
-  }
+  const lineCount = splitLongLines(input.output).length;
+  const perChunk = Math.max(chunkLines, Math.ceil(lineCount / MAX_CHUNKS));
+  const chunks = chunkOutput(input.output, perChunk);
+  if (chunks.length <= 2) return untrimmed(input.output, chunks.length, []);
 
   let stateChunks = chunks.map((chunk) => ({ ...chunk }));
   let state = stateFor(input, stateChunks);
@@ -186,15 +237,31 @@ export async function trimOutput(
     stateTokens = estimateTokens(JSON.stringify(state));
   }
   if (stateTokens > maxStateTokens) {
+    // Chunks left out of the state are never scored, so they are KEPT, not
+    // dropped: an error in the middle of a long output must not disappear
+    // because the state did not fit.
     omitted = new Set(
       chunks
         .map((_, index) => index)
-        .filter((index) => index >= 40 && index < chunks.length - 40),
+        .filter(
+          (index) =>
+            index >= 40 && index < chunks.length - 40 && !ERROR_PATTERN.test(chunks[index]!.text),
+        ),
     );
     stateChunks = chunks.map((chunk, index) =>
       omitted.has(index)
         ? { ...chunk, text: '[… omitted from state …]' }
         : { ...chunk },
+    );
+    state = stateFor(input, stateChunks);
+    stateTokens = estimateTokens(JSON.stringify(state));
+  }
+
+  if (stateTokens > maxStateTokens) {
+    stateChunks = chunks.map((chunk, index) =>
+      omitted.has(index)
+        ? { ...chunk, text: '[… omitted from state …]' }
+        : { ...chunk, text: chunk.text.slice(0, 400) },
     );
     state = stateFor(input, stateChunks);
     stateTokens = estimateTokens(JSON.stringify(state));
@@ -221,8 +288,11 @@ export async function trimOutput(
   const keptIndexes = new Set<number>();
   for (let index = 0; index < chunks.length; index += 1) {
     if (
-      !omitted.has(index) &&
-      (index === 0 || index === chunks.length - 1 || scores[index]! >= keepThreshold)
+      omitted.has(index) ||
+      index === 0 ||
+      index === chunks.length - 1 ||
+      ERROR_PATTERN.test(chunks[index]!.text) ||
+      scores[index]! >= keepThreshold
     ) {
       keptIndexes.add(index);
     }
@@ -230,18 +300,7 @@ export async function trimOutput(
   const droppedIndexes = chunks
     .map((_, index) => index)
     .filter((index) => !keptIndexes.has(index));
-  if (droppedIndexes.length === 0) {
-    return {
-      output: input.output,
-      trimmed: false,
-      chunks: chunks.length,
-      kept: chunks.length,
-      dropped: 0,
-      charsBefore: input.output.length,
-      charsAfter: input.output.length,
-      scores,
-    };
-  }
+  if (droppedIndexes.length === 0) return untrimmed(input.output, chunks.length, scores);
 
   const parts: string[] = [];
   for (let index = 0; index < chunks.length;) {
