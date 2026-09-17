@@ -168,6 +168,16 @@ auto-compaction) goes through Jev: the toast reads
 replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
 could not remove enough (short sessions, or when it fails).
 
+Long Bash output is trimmed by default. To turn it off (or change any other
+option) after installing, run `/plugin configure fast-jev-compaction` inside
+Claude Code, or set it in `~/.claude/settings.json`:
+
+```json
+{ "pluginConfigs": { "fast-jev-compaction@fast-jev-compaction": { "options": { "bashOutput": false } } } }
+```
+
+then `/reload-plugins`. Compaction keeps working either way.
+
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
