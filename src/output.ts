@@ -194,10 +194,15 @@ function untrimmed(output: string, chunks: number, scores: number[]): TrimOutput
   };
 }
 
-export async function trimOutput(
+function maxTokensExceeded(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('max_tokens_exceeded');
+}
+
+async function trimOutputAttempt(
   input: TrimOutputInput,
   asker: JevAsker,
   options: TrimOutputOptions = {},
+  retriesRemaining = 2,
 ): Promise<TrimOutputResult> {
   const minChars = Math.max(0, finite(options.minChars, DEFAULT_MIN_CHARS));
   const chunkLines = Math.max(
@@ -271,18 +276,32 @@ export async function trimOutput(
   const scores = Array<number>(chunks.length).fill(0);
   scores[0] = 1;
   scores[chunks.length - 1] = 1;
-  const questionBatches = batches(asked, stateTokens);
-  const answered = await Promise.all(
-    questionBatches.map(async (batch) => {
-      const questions = Object.assign({}, ...batch.map(questionFor));
-      return asker.ask(state, questions);
-    }),
-  );
-  let answerOffset = 0;
-  for (const batch of questionBatches) {
-    const response = answered[answerOffset++];
-    if (!response) throw new Error('Missing Jev output answer batch');
-    for (const chunk of batch) scores[chunks.indexOf(chunk)] = noulAnswer(response.answers, chunk.id);
+  try {
+    const questionBatches = batches(asked, stateTokens);
+    const answered = await Promise.all(
+      questionBatches.map(async (batch) => {
+        const questions = Object.assign({}, ...batch.map(questionFor));
+        return asker.ask(state, questions);
+      }),
+    );
+    let answerOffset = 0;
+    for (const batch of questionBatches) {
+      const response = answered[answerOffset++];
+      if (!response) throw new Error('Missing Jev output answer batch');
+      for (const chunk of batch) {
+        scores[chunks.indexOf(chunk)] = noulAnswer(response.answers, chunk.id);
+      }
+    }
+  } catch (error) {
+    if (maxTokensExceeded(error) && retriesRemaining > 0 && maxStateTokens >= 2_000) {
+      return trimOutputAttempt(
+        input,
+        asker,
+        { ...options, maxStateTokens: Math.floor(maxStateTokens / 2) },
+        retriesRemaining - 1,
+      );
+    }
+    throw error;
   }
 
   const keptIndexes = new Set<number>();
@@ -324,4 +343,12 @@ export async function trimOutput(
     charsAfter: output.length,
     scores,
   };
+}
+
+export async function trimOutput(
+  input: TrimOutputInput,
+  asker: JevAsker,
+  options?: TrimOutputOptions,
+): Promise<TrimOutputResult> {
+  return trimOutputAttempt(input, asker, options, 2);
 }

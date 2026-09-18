@@ -300,6 +300,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       try {
         if (answer.deny !== undefined || answer.isError || !answer.result) return answer;
         const record = answer.result;
+        if ('persistedOutputPath' in record && record.persistedOutputPath) return answer;
         const combined = record.stdout + (record.stderr ? `\n${record.stderr}` : '');
         if (combined.length <= configured.bashOutputMinChars) return answer;
         const apiKey = await getApiKey($, configured);

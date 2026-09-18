@@ -111,6 +111,55 @@ describe('trimOutput', () => {
       ),
     ).rejects.toThrow('network unavailable');
   });
+
+  it('retries with a smaller state after max_tokens_exceeded', async () => {
+    let calls = 0;
+    const asker: JevAsker = {
+      async ask(_state, questions) {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error(
+            'Jev request failed (400): {"detail":{"error_type":"max_tokens_exceeded"}}',
+          );
+        }
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((id) => [
+              id,
+              { type: 'noul' as const, noul: id === 'c1' || id === 'c10' ? 0.9 : 0.1 },
+            ]),
+          ),
+        };
+      },
+    };
+    const result = await trimOutput(
+      { command: 'run command', goal: 'test', output: outputLines().join('\n') },
+      asker,
+      { minChars: 1, chunkLines: 20 },
+    );
+    expect(result.trimmed).toBe(true);
+    expect(calls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('bounds retries when max_tokens_exceeded persists', async () => {
+    let calls = 0;
+    const asker: JevAsker = {
+      async ask() {
+        calls += 1;
+        throw new Error(
+          'Jev request failed (400): {"detail":{"error_type":"max_tokens_exceeded"}}',
+        );
+      },
+    };
+    await expect(
+      trimOutput(
+        { command: 'run command', goal: 'test', output: outputLines().join('\n') },
+        asker,
+        { minChars: 1, chunkLines: 20 },
+      ),
+    ).rejects.toThrow('max_tokens_exceeded');
+    expect(calls).toBe(3);
+  });
 });
 
 describe('Bash output hook options', () => {
