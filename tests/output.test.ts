@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { trimOutput } from '../src/output.js';
+import { estimateTokens } from '../src/state.js';
 import type { JevAsker } from '../src/types.js';
 import { resolveHookConfig } from '../hooks/fast-jev.ts';
 
@@ -21,6 +22,10 @@ function askerFor(score: (id: string) => number, calls: { count: number }): JevA
 
 function outputLines(): string[] {
   return Array.from({ length: 200 }, (_, index) => `line-${index + 1}`);
+}
+
+function estimateOutputTokens(text: string): number {
+  return estimateTokens(text) + (text.match(/\d/g)?.length ?? 0) / 2;
 }
 
 describe('trimOutput', () => {
@@ -159,6 +164,44 @@ describe('trimOutput', () => {
       ),
     ).rejects.toThrow('max_tokens_exceeded');
     expect(calls).toBe(3);
+  });
+
+  it('fits digit-heavy output to the state budget', async () => {
+    const output = Array.from({ length: 20_000 }, (_, index) => String(index + 1)).join('\n');
+    const defaultStates: number[] = [];
+    const asker = (states: number[]): JevAsker => ({
+      async ask(state, questions) {
+        states.push(estimateOutputTokens(JSON.stringify(state)));
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((id) => [
+              id,
+              { type: 'noul' as const, noul: 0.1 },
+            ]),
+          ),
+        };
+      },
+    });
+
+    const result = await trimOutput(
+      { command: 'seq 1 20000', goal: '', output },
+      asker(defaultStates),
+      {},
+    );
+    expect(result.trimmed).toBe(true);
+    expect(result.output).toContain('1\n2');
+    expect(result.output).toContain('19999\n20000');
+    expect(defaultStates.length).toBeGreaterThan(0);
+    expect(defaultStates.every((tokens) => tokens <= 25_000)).toBe(true);
+
+    const smallStates: number[] = [];
+    await trimOutput(
+      { command: 'seq 1 20000', goal: '', output },
+      asker(smallStates),
+      { maxStateTokens: 5_000 },
+    );
+    expect(smallStates.length).toBeGreaterThan(0);
+    expect(Math.max(...smallStates)).toBeLessThan(Math.max(...defaultStates));
   });
 });
 

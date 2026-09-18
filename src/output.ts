@@ -12,6 +12,8 @@ const MAX_CHUNKS = 200;
 const MAX_LINE_CHARS = 2_000;
 const ERROR_PATTERN =
   /\b(error|errors|failed|failure|fatal|exception|traceback|panic|assert|denied|refused|timeout|cannot|unable|warning)\b/i;
+const estimateOutputTokens = (text: string): number =>
+  estimateTokens(text) + (text.match(/\d/g)?.length ?? 0) / 2;
 
 const OUTPUT_CONTEXT =
   'A coding agent ran a shell command. Its output is split into numbered chunks. The agent will only see the chunks that are kept; the full output is saved to a file it can read later. Decide which chunks the agent needs to understand the outcome of the command and continue its task: errors, failures, warnings, summaries, final results, and lines the task depends on are needed; repetitive progress output, verbose listings, download/install noise and boilerplate are not.';
@@ -149,7 +151,7 @@ function batches(
   let current: OutputChunk[] = [];
   let currentTokens = 0;
   for (const chunk of chunks) {
-    const tokens = estimateTokens(JSON.stringify(questionFor(chunk)));
+    const tokens = estimateOutputTokens(JSON.stringify(questionFor(chunk)));
     if (current.length > 0 && currentTokens + tokens > budget) {
       result.push(current);
       current = [];
@@ -228,7 +230,7 @@ async function trimOutputAttempt(
 
   let stateChunks = chunks.map((chunk) => ({ ...chunk }));
   let state = stateFor(input, stateChunks);
-  let stateTokens = estimateTokens(JSON.stringify(state));
+  let stateTokens = estimateOutputTokens(JSON.stringify(state));
   let omitted = new Set<number>();
   if (stateTokens > maxStateTokens) {
     stateChunks = chunks.map((chunk) => ({
@@ -239,7 +241,7 @@ async function trimOutputAttempt(
         .join('\n'),
     }));
     state = stateFor(input, stateChunks);
-    stateTokens = estimateTokens(JSON.stringify(state));
+    stateTokens = estimateOutputTokens(JSON.stringify(state));
   }
   if (stateTokens > maxStateTokens) {
     // Chunks left out of the state are never scored, so they are KEPT, not
@@ -259,17 +261,49 @@ async function trimOutputAttempt(
         : { ...chunk },
     );
     state = stateFor(input, stateChunks);
-    stateTokens = estimateTokens(JSON.stringify(state));
+    stateTokens = estimateOutputTokens(JSON.stringify(state));
   }
 
   if (stateTokens > maxStateTokens) {
-    stateChunks = chunks.map((chunk, index) =>
-      omitted.has(index)
-        ? { ...chunk, text: '[… omitted from state …]' }
-        : { ...chunk, text: chunk.text.slice(0, 400) },
-    );
-    state = stateFor(input, stateChunks);
-    stateTokens = estimateTokens(JSON.stringify(state));
+    let perChunkChars = 400;
+    while (stateTokens > maxStateTokens) {
+      stateChunks = chunks.map((chunk, index) =>
+        omitted.has(index)
+          ? { ...chunk, text: '[… omitted from state …]' }
+          : { ...chunk, text: chunk.text.slice(0, perChunkChars) },
+      );
+      state = stateFor(input, stateChunks);
+      stateTokens = estimateOutputTokens(JSON.stringify(state));
+      if (stateTokens <= maxStateTokens || perChunkChars === 50) break;
+      perChunkChars = Math.max(50, Math.floor(perChunkChars / 2));
+    }
+
+    if (stateTokens > maxStateTokens) {
+      const middle = (chunks.length - 1) / 2;
+      const candidates = chunks
+        .map((_, index) => index)
+        .filter(
+          (index) =>
+            index !== 0 &&
+            index !== chunks.length - 1 &&
+            !omitted.has(index) &&
+            !ERROR_PATTERN.test(chunks[index]!.text),
+        )
+        .sort((left, right) => {
+          const distance = Math.abs(left - middle) - Math.abs(right - middle);
+          return distance || left - right;
+        });
+      for (let start = 0; stateTokens > maxStateTokens && start < candidates.length; start += 10) {
+        for (const index of candidates.slice(start, start + 10)) omitted.add(index);
+        stateChunks = chunks.map((chunk, index) =>
+          omitted.has(index)
+            ? { ...chunk, text: '[… omitted from state …]' }
+            : { ...chunk, text: chunk.text.slice(0, 50) },
+        );
+        state = stateFor(input, stateChunks);
+        stateTokens = estimateOutputTokens(JSON.stringify(state));
+      }
+    }
   }
 
   const asked = chunks.filter((_, index) => !omitted.has(index));
