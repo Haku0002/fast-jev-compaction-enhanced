@@ -34,6 +34,12 @@
       "description": "Minimum estimated character reduction required to replace history.",
       "default": 0.25
     },
+    "archiveResults": {
+      "type": "boolean",
+      "title": "Save dropped tool results",
+      "description": "Write tool results dropped by compaction to .claude/fast-jev-compaction/ and cite the file in their marker, so they can be read back.",
+      "default": true
+    },
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",

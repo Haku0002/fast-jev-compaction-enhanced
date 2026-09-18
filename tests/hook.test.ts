@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  archiveWriter,
   compactSession,
   decisionLog,
   decisionLogLines,
@@ -57,6 +58,7 @@ describe('hook config', () => {
       bashOutput: false,
       bashOutputMinChars: 4_000,
       bashOutputChunkLines: 20,
+      archiveResults: true,
       compactAtPercent: 60,
       minReductionRatio: 0.25,
       model: 'jev-latest',
@@ -72,6 +74,7 @@ describe('hook config', () => {
       bashOutput: false,
       bashOutputMinChars: 4_000,
       bashOutputChunkLines: 20,
+      archiveResults: true,
       compactAtPercent: 60,
       minReductionRatio: 0.25,
     });
@@ -155,5 +158,43 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('archiveWriter', () => {
+  const fsStub = () => {
+    const files = new Map<string, string>();
+    return {
+      files,
+      fs: {
+        exists: async (path: string) => files.has(path),
+        write: async (path: string, text: string) => void files.set(path, text),
+      },
+    };
+  };
+
+  it('names a file per dropped result and writes them on flush, with a .gitignore', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub);
+    const path = writer.cite('toolu_1', 'a'.repeat(5000));
+    expect(path).toBe('.claude/fast-jev-compaction/result-toolu_1.txt');
+    expect(stub.files.size).toBe(0);
+    await writer.flush();
+    expect(stub.files.get('.claude/fast-jev-compaction/.gitignore')).toBe('*\n');
+    expect(stub.files.get(path!)?.length).toBe(5000);
+  });
+
+  it('never writes output that looks like credentials', async () => {
+    const stub = fsStub();
+    const writer = archiveWriter(stub);
+    expect(writer.cite('toolu_2', 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG')).toBeUndefined();
+    await writer.flush();
+    expect(stub.files.size).toBe(0);
+  });
+
+  it('writes nothing when no result was cited', async () => {
+    const stub = fsStub();
+    await archiveWriter(stub).flush();
+    expect(stub.files.size).toBe(0);
   });
 });
