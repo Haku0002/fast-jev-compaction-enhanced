@@ -149,6 +149,20 @@ function truncatedResultText(
   }${where}]`;
 }
 
+/** One line standing in for a dropped call, naming where its output went. */
+function droppedCallNote(tool: ToolUse, archivedPath: string | undefined): string {
+  let input = '';
+  try {
+    input = JSON.stringify(tool.input);
+  } catch {
+    input = '{}';
+  }
+  if (input.length > 160) input = `${input.slice(0, 159)}…`;
+  return `[fast-jev-compaction removed the ${tool.tool} call ${input}${
+    archivedPath ? `; full output: ${archivedPath} (Read or grep it if needed)` : ''
+  }]`;
+}
+
 /**
  * Rebuilds the conversation from the decisions. A dropped call disappears
  * together with its result; a dropped result keeps a bounded head and note.
@@ -177,6 +191,11 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
+    // A dropped call leaves one line naming it and where its output was saved,
+    // so a detail inside it can still be recovered.
+    const notes = message.toolUses
+      .filter((tool) => actions.get(tool.tool_use_id) === 'drop_call')
+      .map((tool) => droppedCallNote(tool, archive?.(tool.tool_use_id, tool.text ?? '')));
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
@@ -230,10 +249,11 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+    const text = notes.length > 0 ? [message.text, ...notes].filter(Boolean).join('\n') : message.text;
+    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
       continue;
     }
-    const rebuilt: Message = { role: message.role, text: message.text, toolUses };
+    const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
   }
