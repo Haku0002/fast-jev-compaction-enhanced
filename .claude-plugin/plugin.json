@@ -56,7 +56,7 @@
       "type": "boolean",
       "title": "Trim Bash output",
       "description": "Trim long Bash output with Jev before the model sees it",
-      "default": true
+      "default": false
     },
     "bashOutputMinChars": {
       "type": "number",

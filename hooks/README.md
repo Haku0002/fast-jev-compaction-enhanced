@@ -55,7 +55,7 @@ The plugin declares these `userConfig` values in
 | `maxStateTokens` | `25000` |
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
-| `bashOutput` | `true` |
+| `bashOutput` | `false` |
 | `bashOutputMinChars` | `4000` |
 | `bashOutputChunkLines` | `20` |
 | `model` | `jev-latest` |
@@ -82,7 +82,7 @@ fails, the Bash result passes through unchanged.
 
 The Bash output options are:
 
-- `bashOutput` enables trimming and defaults to `true`.
+- `bashOutput` enables trimming and defaults to `false` (opt-in).
 - `bashOutputMinChars` defaults to `4000`; shorter output passes through.
 - `bashOutputChunkLines` defaults to `20` lines per Jev chunk.
 

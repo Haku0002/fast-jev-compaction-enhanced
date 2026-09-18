@@ -54,7 +54,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
-      bashOutput: true,
+      bashOutput: false,
       bashOutputMinChars: 4_000,
       bashOutputChunkLines: 20,
       compactAtPercent: 60,
@@ -69,7 +69,7 @@ describe('hook config', () => {
       maxStateTokens: 1000,
       model: 'jev-x',
       goal: 'g',
-      bashOutput: true,
+      bashOutput: false,
       bashOutputMinChars: 4_000,
       bashOutputChunkLines: 20,
       compactAtPercent: 60,

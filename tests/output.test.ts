@@ -165,18 +165,18 @@ describe('trimOutput', () => {
 describe('Bash output hook options', () => {
   it('uses the Bash trimming defaults and accepts overrides', () => {
     expect(resolveHookConfig({})).toMatchObject({
-      bashOutput: true,
+      bashOutput: false,
       bashOutputMinChars: 4_000,
       bashOutputChunkLines: 20,
     });
     expect(
       resolveHookConfig({
-        bashOutput: false,
+        bashOutput: true,
         bashOutputMinChars: 100,
         bashOutputChunkLines: 5,
       }),
     ).toMatchObject({
-      bashOutput: false,
+      bashOutput: true,
       bashOutputMinChars: 100,
       bashOutputChunkLines: 5,
     });

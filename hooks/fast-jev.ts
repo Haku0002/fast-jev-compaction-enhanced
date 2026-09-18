@@ -22,7 +22,7 @@ import type {
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
-  bashOutput: true,
+  bashOutput: false,
   bashOutputMinChars: 4_000,
   bashOutputChunkLines: 20,
   compactAtPercent: 60,
