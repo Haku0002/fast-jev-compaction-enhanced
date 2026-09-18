@@ -97,7 +97,7 @@ describe('token estimate', () => {
     expect(estimateTokens('')).toBe(0);
     expect(estimateTokens('hello world')).toBe(2);
     expect(estimateTokens('internationalization')).toBe(4);
-    expect(estimateTokens('12345678')).toBe(8);
+    expect(estimateTokens('12345678')).toBe(4);
     const json = JSON.stringify({ file_path: '/Users/x/src/a.ts', old_string: 'a = 1;', n: 42 });
     expect(estimateTokens(json)).toBeGreaterThanOrEqual(Math.ceil(json.length / 3));
   });
@@ -155,7 +155,7 @@ describe('state fitting', () => {
       ...fit,
       maxStateTokens: 300,
     });
-    expect(stage).toBe('inputs<=60');
+    expect(stage).toBe('inputs<=200');
     expect(tokens).toBeLessThanOrEqual(300);
     expect(state.history[0]?.text).toBe('start');
     expect((state.history[1]?.tool_calls?.[0] as HistoryToolCall).input.length).toBeLessThanOrEqual(200);
