@@ -1,9 +1,21 @@
 {
   "name": "fast-jev-compaction",
   "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself (no extra key).",
   "license": "MIT",
   "userConfig": {
+    "backend": {
+      "type": "string",
+      "title": "Judge backend",
+      "description": "Who scores the tool calls: 'claude' uses the session's own API client via $.model.complete (no key needed); 'jev' uses TypeSafe Jev over HTTP; 'auto' picks jev when a TypeSafe key is set, else claude.",
+      "default": "auto"
+    },
+    "claudeModel": {
+      "type": "string",
+      "title": "Claude judge model",
+      "description": "Model alias or id for the Claude judge (backend=claude), e.g. haiku.",
+      "default": "haiku"
+    },
     "apiKey": {
       "type": "string",
       "title": "TypeSafe API key",

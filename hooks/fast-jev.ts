@@ -8,6 +8,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
+import { claudeAsker, DEFAULT_CLAUDE_MODEL, type Completer } from '../src/claude-asker.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
@@ -19,10 +20,14 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
+export type Backend = 'auto' | 'jev' | 'claude';
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  backend: 'auto' as Backend,
+  claudeModel: DEFAULT_CLAUDE_MODEL,
 };
 
 export type HookFetchInit = {
@@ -45,6 +50,10 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  /** Which judge scores the calls: Jev over HTTP, Claude over `$.model.complete`, or Jev when a key is set. */
+  backend: Backend;
+  /** Model alias or id for the Claude judge. */
+  claudeModel: string;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -55,6 +64,10 @@ function optionNumber(options: PluginOptions, key: string, fallback: number): nu
 function optionString(options: PluginOptions, key: string): string | undefined {
   const value = options[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function resolveBackend(value: string | undefined): Backend {
+  return value === 'jev' || value === 'claude' ? value : HOOK_DEFAULTS.backend;
 }
 
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
@@ -79,6 +92,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    backend: resolveBackend(optionString(options, 'backend')),
+    claudeModel: optionString(options, 'claudeModel') ?? HOOK_DEFAULTS.claudeModel,
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
@@ -161,14 +176,30 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** The judge the config and the available key select: `jev` or `claude`. */
+export function selectBackend(config: HookConfig): Exclude<Backend, 'auto'> {
+  if (config.backend === 'auto') return config.apiKey ? 'jev' : 'claude';
+  return config.backend;
+}
+
+/** Builds the asker for the selected judge; throws when Jev is selected without a key. */
+export function pickAsker(config: HookConfig, fetchFn: HookFetch, complete?: Completer): JevAsker {
+  if (selectBackend(config) === 'claude') {
+    if (!complete) throw new Error('Claude judge needs $.model.complete');
+    return claudeAsker(complete, { model: config.claudeModel });
+  }
+  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+  return jevAsker(fetchFn, config.apiKey, config.model);
+}
+
+/** Runs the library over a session transcript; throws when the judge is unavailable or fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  complete?: Completer,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, pickAsker(config, fetchFn, complete), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -263,10 +294,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        (request) => $.model.complete(request),
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -277,7 +313,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `[${selectBackend(config)}] kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {

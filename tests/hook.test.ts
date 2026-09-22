@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   compactSession,
+  selectBackend,
   decisionLog,
   decisionLogLines,
   resolveHookConfig,
@@ -53,7 +54,13 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      model: 'jev-latest',
+      backend: 'auto',
+      claudeModel: 'haiku',
+    });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -64,7 +71,19 @@ describe('hook config', () => {
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
+      backend: 'auto',
+      claudeModel: 'haiku',
     });
+    expect(resolveHookConfig({ backend: 'claude', claudeModel: 'sonnet' })).toMatchObject({ backend: 'claude', claudeModel: 'sonnet' });
+    expect(resolveHookConfig({ backend: 'bogus' }).backend).toBe('auto');
+  });
+
+  it('selects jev only when a key is available in auto mode', () => {
+    const base = resolveHookConfig({});
+    expect(selectBackend(base)).toBe('claude');
+    expect(selectBackend({ ...base, apiKey: 'k' })).toBe('jev');
+    expect(selectBackend({ ...base, apiKey: 'k', backend: 'claude' })).toBe('claude');
+    expect(selectBackend({ ...base, backend: 'jev' })).toBe('jev');
   });
 });
 
@@ -139,8 +158,31 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+  it('scores through the Claude judge when no key is set, sending every question once', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    const prompts: string[] = [];
+    const complete = async (request: { model: string; prompt: string }) => {
+      prompts.push(request.prompt);
+      expect(request.model).toBe('haiku');
+      return '```json\n{"call_t1": 0.1, "result_t1": "0.05", "call_t2": 0.95, "result_t2": 0.8}\n```';
+    };
+    const { result: output, messages } = await compactSession(transcript(), config, jevFetch(() => 0), complete);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('- call_t1:');
+    expect(prompts[0]).toContain('- result_t2:');
+    expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+  });
+
+  it('throws when the Claude judge answers badly so the hook falls back', async () => {
+    const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    await expect(compactSession(transcript(), config, jevFetch(() => 0), async () => 'nope')).rejects.toThrow(/no JSON/);
+    await expect(compactSession(transcript(), config, jevFetch(() => 0), async () => '{"call_t1": 0.1}')).rejects.toThrow(/no probability for/);
+    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/model\.complete/);
+  });
+
+  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), backend: 'jev' as const };
     await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
