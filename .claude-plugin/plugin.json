@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself (no extra key).",
   "license": "MIT",
   "userConfig": {
@@ -24,9 +24,33 @@
     },
     "keepThreshold": {
       "type": "number",
-      "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "title": "Keep-result threshold",
+      "description": "Minimum probability that a tool result is still useful for it to stay verbatim; below it the result is cut to a head.",
       "default": 0.5
+    },
+    "keepCallThreshold": {
+      "type": "number",
+      "title": "Keep-call threshold",
+      "description": "Minimum probability that a tool call still matters for it to stay (with a bounded result); below it the call becomes a stub or is removed.",
+      "default": 0.5
+    },
+    "dropCalls": {
+      "type": "string",
+      "title": "Unneeded calls",
+      "description": "'stub' keeps the tool name, a short input and a note in place of the result, so the history keeps its shape; 'delete' removes the call and its result and marks the turn's narration.",
+      "default": "stub"
+    },
+    "stubChars": {
+      "type": "number",
+      "title": "Stub input characters",
+      "description": "Characters of input kept on a stubbed call.",
+      "default": 120
+    },
+    "pruneMachineText": {
+      "type": "boolean",
+      "title": "Cut host blocks",
+      "description": "Cut system reminders, task notifications and command echoes in old user messages to a head and a note; the person's own words are never touched.",
+      "default": true
     },
     "preserveRecentMessages": {
       "type": "number",
@@ -37,32 +61,44 @@
     "compactAtPercent": {
       "type": "number",
       "title": "Compaction percentage",
-      "description": "Context percentage at which turn.complete requests compaction.",
+      "description": "Context percentage at which turn.complete requests compaction; it does not fire again until the context has fallen 10 points below, or grown 10 points past the last trigger.",
       "default": 60
     },
     "minReductionRatio": {
       "type": "number",
-      "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
+      "title": "Minimum prunable share",
+      "description": "Minimum share of the history that is tool traffic or host blocks for a Jev round to run at all; below it, see nothingToPrune.",
       "default": 0.25
+    },
+    "nothingToPrune": {
+      "type": "string",
+      "title": "When too little is prunable",
+      "description": "'keep' leaves the history unchanged (an automatic compaction at the window limit still gets the built-in summary); 'summary' always hands it to the built-in summary.",
+      "default": "keep"
     },
     "maxStateTokens": {
       "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
+      "title": "Maximum state tokens per request",
+      "description": "Estimated token budget for one request's state (Jev reads at most 32k). The Claude judge defaults to 80000 when unset.",
       "default": 25000
     },
     "maxRequestTokens": {
       "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
+      "title": "Maximum request tokens",
+      "description": "Estimated token budget for one request's state plus its questions. The Claude judge defaults to 100000 when unset.",
       "default": 30000
     },
     "truncateHeadChars": {
       "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "title": "Truncated head",
+      "description": "Characters kept of a tool result, an oversized input field or a host block once the rest is cut; 0 keeps only the note.",
       "default": 300
+    },
+    "concurrency": {
+      "type": "number",
+      "title": "Requests in flight",
+      "description": "Judge requests sent at once.",
+      "default": 4
     },
     "model": {
       "type": "string",

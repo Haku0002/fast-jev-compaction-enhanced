@@ -37,12 +37,18 @@ export interface ToolCall {
   tool_use_id: string;
   tool: string;
   input: Record<string, unknown>;
+  /** Characters of the serialised input. */
+  inputChars: number;
   /** Index of the message holding the tool_use block. */
   callIndex: number;
   /** Index of the message holding the tool_result block. */
   resultIndex: number;
   resultChars: number;
+  /** The first characters of the result, whitespace collapsed, for the state. */
+  resultHead: string;
   isError: boolean;
+  /** The result is a note an earlier compaction round left, not tool output. */
+  tombstone: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
 }
@@ -50,17 +56,31 @@ export interface ToolCall {
 export interface CallAnswer {
   /** Jev's probability that the call itself still matters. */
   keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
+  /** Jev's probability that the full result is still needed; 0 when not asked. */
   keepResult: number;
 }
 
-export type CallAction = 'keep' | 'drop_result' | 'drop_call';
+/**
+ * `keep` leaves the call and its result as they are; `drop_result` keeps the
+ * call with a bounded input and the head of its result; `stub_call` keeps
+ * only the tool name, a short input and a note in place of the result;
+ * `drop_call` removes the call and its result and marks the narration.
+ */
+export type CallAction = 'keep' | 'drop_result' | 'stub_call' | 'drop_call';
+
+export type CallReason =
+  | 'pinned'
+  | 'unscored'
+  | 'kept'
+  | 'result_dropped'
+  | 'call_stubbed'
+  | 'call_dropped';
 
 export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: CallReason;
 }
 
 export interface HistoryToolCall {
@@ -72,70 +92,98 @@ export interface HistoryToolCall {
 
 export interface HistoryEntry {
   i: number;
-  role: Role;
+  /** `note` marks a range of messages this request does not show. */
+  role: Role | 'note';
   text: string;
-  /** Structured per call, or one compact line per call once the state has to shrink. */
+  /** Structured per call in the window shown in full, one line per call elsewhere. */
   tool_calls?: HistoryToolCall[] | string[];
 }
 
-/** The state sent with every Jev request: the whole history, results omitted. */
+/** The state of one Jev request: the goal, a window of the history in full, the rest in notes. */
 export interface CompactionState {
   context: string;
   goal: string;
   history: HistoryEntry[];
 }
 
-export interface FittedState {
+/** One request: the state and the candidate calls it shows in full and asks about. */
+export interface PlannedRequest {
   state: CompactionState;
+  calls: ToolCall[];
+  /** Estimated tokens of the state alone. */
   tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
-  stage: string;
 }
 
+/** What becomes of a call judged no longer needed: a stub keeps the shape of the history. */
+export type DropCalls = 'stub' | 'delete';
+
 export interface CompactOptions {
-  /** Ongoing task description; defaults to the last few user prompts. */
+  /** Ongoing task description; defaults to the last few human prompts. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
+  /** Minimum keep probability for a full result to stay verbatim. Default 0.5. */
   keepThreshold?: number;
+  /** Minimum keep probability for a call to stay (with a bounded result). Default 0.5. */
+  keepCallThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
+  /** Estimated token ceiling for one request's state. Default 25000. */
   maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
+  /** Estimated token ceiling for one request's state plus its questions. Default 30000. */
   maxRequestTokens?: number;
-  /** Characters of a dropped tool result to retain. Default 300. */
+  /** Characters of a dropped tool result, or of an oversized input field, to retain. Default 300. */
   truncateHeadChars?: number;
+  /** `stub` (default) keeps a stub of a call judged unneeded; `delete` removes it and marks the narration. */
+  dropCalls?: DropCalls;
+  /** Characters of input kept on a stubbed call. Default 120. */
+  stubChars?: number;
+  /** Cut machine-generated blocks (system reminders, task notifications, command echoes) in old user messages. Default true. */
+  pruneMachineText?: boolean;
+  /** Jev requests in flight at once. Default 4. */
+  concurrency?: number;
 }
 
 export interface ResolvedCompactOptions {
   goal: string;
   keepThreshold: number;
+  keepCallThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  dropCalls: DropCalls;
+  stubChars: number;
+  pruneMachineText: boolean;
+  concurrency: number;
+}
+
+export interface CompactStats {
+  messagesBefore: number;
+  messagesAfter: number;
+  charsBefore: number;
+  charsAfter: number;
+  /** Characters the compaction could remove at most: candidate inputs, results and machine blocks. */
+  prunableChars: number;
+  calls: number;
+  kept: number;
+  resultsDropped: number;
+  callsStubbed: number;
+  callsDropped: number;
+  pinned: number;
+  /** Candidates no request could show; kept untouched. */
+  unscored: number;
+  /** Old user messages whose machine-generated blocks were cut. */
+  machineBlocksPruned: number;
+  /** Estimated tokens of the largest request state. */
+  stateTokens: number;
+  requests: number;
+  ms: number;
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
   decisions: CallDecision[];
-  stats: {
-    messagesBefore: number;
-    messagesAfter: number;
-    charsBefore: number;
-    charsAfter: number;
-    calls: number;
-    kept: number;
-    resultsDropped: number;
-    callsDropped: number;
-    pinned: number;
-    stateTokens: number;
-    /** Which fitting stage the state needed, '' when no request was made. */
-    stateStage: string;
-    requests: number;
-    ms: number;
-  };
+  stats: CompactStats;
 }
 
 /** The `state` of a Jev request: a string or any JSON-serialisable object. */

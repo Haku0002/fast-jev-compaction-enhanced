@@ -23,38 +23,54 @@ built-in compaction summary with the original messages.
 1. Every `tool_use` is paired with its `tool_result` by `tool_use_id`. Calls in
    the first message or in the newest `preserveRecentMessages` messages are
    pinned and never touched.
-2. The **state** sent to Jev is the whole conversation so far, oldest first,
-   with every tool result replaced by a short note (`ok, 4213 chars (omitted)`).
-   Tool inputs are included, texts are included, nothing is summarized.
-3. The state is fitted into `maxStateTokens` (25k by default) in stages, each
-   applied only if the previous one was not enough: tool inputs truncated to
-   1000, then 200, then 60 characters; long texts abridged to head + tail,
-   oldest non-pinned messages first; old non-pinned messages collapsed to a
-   `[… N chars omitted …]` note; old tool calls reduced to one line each
-   (`t12 Read file_path=src/a.ts → ok 480ch`); old call-less messages left
-   out; runs of old call-only messages folded into one entry. If it still
-   does not fit, compaction throws. Tokens are estimated without a tokenizer (a
-   word per six letters, half a token per digit, ~one per other symbol),
-   calibrated to land a little above the counts Jev reports.
-4. For every non-pinned call Jev gets two `noul` questions: should the **call**
-   stay (knowing it was made, with its input, still matters), and should the
-   **result** stay verbatim (its contents are still needed and re-running the
-   tool would not do).
-5. Questions are split into as many requests as needed so state plus questions
-   stays under `maxRequestTokens` (30k by default, under Jev's 32k request
-   limit). The same full state is resent with every request; requests run
-   concurrently and their answers are merged.
-6. Decisions per call, against `keepThreshold`:
-   - `keepResult ≥ threshold` → keep call and result;
-   - else `keepCall ≥ threshold` → keep the call, truncate the result to its
-     first `truncateHeadChars` characters plus a one-line note;
-   - else → remove the call together with its result.
-7. The message list is rebuilt: a message that loses all its content is
+2. The candidates are walked oldest first and cut into **windows** of
+   consecutive messages. Each window goes to the judge in one request whose
+   **state** shows the window in full: every call with its input (up to 300
+   characters) and the head of its output (160 characters), texts abridged to
+   head + tail, host blocks (system reminders, task notifications) elided.
+   The first message and the newest `preserveRecentMessages` messages frame
+   every window, and a `note` entry stands for each range the request leaves
+   out. A window closes when its state would pass `maxStateTokens` (25k by
+   default) or state plus questions `maxRequestTokens` (30k, under Jev's 32k
+   request limit). A candidate that does not fit even alone is retried with
+   texts collapsed and calls one-lined, and kept untouched (`unscored`) if
+   that fails too. So every call the judge is asked about is one it can see.
+3. Tokens are estimated without a tokenizer (a word per six letters, half a
+   token per digit, 1.15 per CJK character, a third per character of a dense
+   run such as a hash or base64, ~one per other symbol), calibrated on real
+   requests to land 1-6% above the counts Jev reports.
+4. For every candidate the judge gets a `noul` question: does the **call**
+   still carry information the task depends on (a file or command being
+   worked with, a decision, a constraint, an edit that was made). When the
+   result is long enough that cutting it would change something, and is not
+   a note left by an earlier round, a second question asks whether its
+   **output** holds information the assistant would need again (an error, a
+   value, contents being edited) beyond what re-running the tool would give.
+5. Requests run with `concurrency` in flight; a rate limit or server error is
+   retried once. Answers are merged.
+6. Decisions per call:
+   - `keepResult >= keepThreshold` -> keep call and result verbatim;
+   - else `keepCall >= keepCallThreshold` -> keep the call, cut the result to
+     its first `truncateHeadChars` characters plus a note, and cut every
+     oversized input field (a Write's content, an Edit's strings) the same
+     way;
+   - else -> `dropCalls: 'stub'` (default) keeps the tool name, the input cut
+     to `stubChars` characters and a one-line note in place of the result,
+     so the history keeps a call before every report the assistant wrote;
+     `dropCalls: 'delete'` removes the call with its result and appends a
+     marker to the turn's narration saying so.
+7. Machine-generated blocks in old user messages (`<system-reminder>`,
+   `<task-notification>`, command echoes) are cut to a head and a note by
+   rule, without a question (`pruneMachineText`). The person's own words,
+   and every assistant text, stay verbatim and in order.
+8. The message list is rebuilt: a message that loses all its content is
    removed, untouched messages are returned as the same objects, and no result
    is ever left without its call.
 
-Jev failures, malformed answers, a missing key, or a history that cannot be
-fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
+Jev failures, malformed answers and a missing key throw; the caller (or the
+Claude Code hook) decides what to fall back to. `prunableShare(messages)`
+tells, without a request, how much of a history is tool traffic and host
+blocks at all.
 
 ## Install and usage
 
@@ -90,8 +106,8 @@ can be passed in as is.
 To bring your own transport, implement `JevAsker` (one `ask(state, questions)`
 method) and call `compact(messages, asker, options)`; `buildJevRequest` and
 `parseJevResponse` give you the HTTP request body and response validation.
-The building blocks (`collectToolCalls`, `fitState`, `batchCalls`,
-`decideCall`, `applyDecisions`) are exported too.
+The building blocks (`collectToolCalls`, `planRequests`, `questionsFor`,
+`decideCall`, `applyDecisions`, `pruneMachineBlocks`) are exported too.
 
 `apiKey` defaults to `process.env.TYPESAFE_API_KEY`. Never commit the key or
 put it in a source file.
@@ -104,33 +120,41 @@ put it in a source file.
 | `model` | `jev-latest` | Jev model name |
 | `baseUrl` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
-| `goal` | last 3 user prompts | Ongoing task description included in the state |
-| `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
+| `goal` | last 3 human prompts | Ongoing task description included in the state |
+| `keepThreshold` | `0.5` | Minimum probability for a result to stay verbatim |
+| `keepCallThreshold` | `0.5` | Minimum probability for a call to stay (with a bounded result) |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
-| `maxStateTokens` | `25000` | Estimated token ceiling for the state |
-| `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
-| `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
+| `maxStateTokens` | `25000` | Estimated token ceiling for one request's state |
+| `maxRequestTokens` | `30000` | Estimated ceiling for one request's state plus questions |
+| `truncateHeadChars` | `300` | Characters kept of a cut result, input field or host block |
+| `dropCalls` | `stub` | What becomes of an unneeded call: `stub` or `delete` |
+| `stubChars` | `120` | Characters of input kept on a stub |
+| `pruneMachineText` | `true` | Cut host blocks in old user messages |
+| `concurrency` | `4` | Requests in flight at once |
 
-`result.stats` reports message and character counts before and after, the
-per-reason decision counts, the state size in estimated tokens, which fitting
-stage was needed, and the number of requests.
+`result.stats` reports message and character counts before and after, how
+many characters were prunable at all, the per-reason decision counts, the
+largest request state in estimated tokens, and the number of requests.
 
 ## Limitations
 
-- Only tool calls and results are candidates; text messages are never removed
-  or shortened in the output (they are only abridged in the state Jev sees).
+- Only tool calls, results and host blocks are candidates; the person's and
+  the assistant's text is never removed or shortened in the output (it is
+  only abridged in the state the judge sees).
 - Token sizes are estimates from character counts, not a tokenizer.
 - Calibration is at the request level; a probability is not a proof that a
-  result is safe to delete. The assistant can always re-run the tool.
-- The full state is repeated with every request, so a history near the state
-  ceiling costs one request per handful of questions.
+  result is safe to cut. The assistant can always re-run the tool.
+- The judge sees each window with the frame around it, not the whole
+  history at once; a result whose value only shows far away from its call
+  may be cut.
 
 ## Claude Code plugin
 
 The repository root is a Claude Code function-hook plugin: `hooks/fast-jev.ts`
-is a thin adapter that feeds `session.compact` transcripts through `src/` and
-falls back to Claude Code's built-in summary on errors or insufficient
-reduction. See [`hooks/README.md`](hooks/README.md) for configuration and the
+is a thin adapter that feeds `session.compact` transcripts through `src/`,
+scored by Jev when `TYPESAFE_API_KEY` is set and otherwise by Claude (Haiku
+by default) through the session's own API client, and falls back to Claude
+Code's built-in summary on errors. See [`hooks/README.md`](hooks/README.md) for configuration and the
 Claude Code 2.1.274 type reference.
 
 ### Install in Claude Code
@@ -150,13 +174,16 @@ claude plugin marketplace add tamaratran/fast-jev-compaction
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
-The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
-…); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
-Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
-auto-compaction) goes through Jev: the toast reads
-`fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
+The install prompts for the plugin options (API key, thresholds, `dropCalls`,
+…); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment,
+or leave the key unset to score with the session's own model instead.
+Start a new session (hooks modules load at session start). From then on
+`/compact` (and auto-compaction) goes through the judge: the toast reads
+`[manual] [jev] kept N/M messages, no summary (…)` when the pruned history
+replaced the built-in summary, `… history left unchanged` when too little of it
+is tool traffic to be worth a round, or `fallback to built-in summary (…)`
+when the judge fails. Every outcome is also appended to
+`~/.claude/fast-jev-compaction.log`.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is

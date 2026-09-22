@@ -9,11 +9,12 @@ import type {
 } from 'claude-code';
 
 import { claudeAsker, DEFAULT_CLAUDE_MODEL, type Completer } from '../src/claude-asker.js';
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { compact, prunableShare, reductionRatio, resolveOptions } from '../src/compact.js';
+import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, withRetry } from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
+  DropCalls,
   JevAsker,
   Message,
   ToolResult,
@@ -21,6 +22,7 @@ import type {
 } from '../src/types.js';
 
 export type Backend = 'auto' | 'jev' | 'claude';
+export type NothingToPrune = 'keep' | 'summary';
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
@@ -28,7 +30,15 @@ const HOOK_DEFAULTS = {
   model: DEFAULT_MODEL,
   backend: 'auto' as Backend,
   claudeModel: DEFAULT_CLAUDE_MODEL,
+  nothingToPrune: 'keep' as NothingToPrune,
 };
+
+/** The Claude judge reads far more than Jev; its windows default to this size. */
+const CLAUDE_STATE_TOKENS = 80_000;
+const CLAUDE_REQUEST_TOKENS = 100_000;
+/** Percentage points the context must fall, or grow past the last trigger, before turn.complete compacts again. */
+const REARM_PERCENT = 10;
+const LOG_LINES = 200;
 
 export type HookFetchInit = {
   method?: string;
@@ -54,6 +64,8 @@ export type HookConfig = CompactOptions & {
   backend: Backend;
   /** Model alias or id for the Claude judge. */
   claudeModel: string;
+  /** When too little is prunable: leave the history as it is, or hand it to the built-in summary. */
+  nothingToPrune: NothingToPrune;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -70,15 +82,22 @@ function resolveBackend(value: string | undefined): Backend {
   return value === 'jev' || value === 'claude' ? value : HOOK_DEFAULTS.backend;
 }
 
+function resolveDropCalls(value: string | undefined): DropCalls | undefined {
+  return value === 'stub' || value === 'delete' ? value : undefined;
+}
+
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
 export function resolveHookConfig(options: PluginOptions): HookConfig {
-  const numbers: Partial<Omit<CompactOptions, 'goal'>> = {};
+  const numbers: Partial<Omit<CompactOptions, 'goal' | 'dropCalls' | 'pruneMachineText'>> = {};
   for (const key of [
     'keepThreshold',
+    'keepCallThreshold',
     'preserveRecentMessages',
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'stubChars',
+    'concurrency',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -94,7 +113,14 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     backend: resolveBackend(optionString(options, 'backend')),
     claudeModel: optionString(options, 'claudeModel') ?? HOOK_DEFAULTS.claudeModel,
+    nothingToPrune:
+      optionString(options, 'nothingToPrune') === 'summary' ? 'summary' : HOOK_DEFAULTS.nothingToPrune,
   };
+  const dropCalls = resolveDropCalls(optionString(options, 'dropCalls'));
+  if (dropCalls) config.dropCalls = dropCalls;
+  if (typeof options['pruneMachineText'] === 'boolean') {
+    config.pruneMachineText = options['pruneMachineText'];
+  }
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
   const goal = optionString(options, 'goal');
@@ -102,17 +128,27 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `JevAsker` over the engine's `$.http.fetch`, with one retry on a transient failure. */
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  sleep?: (ms: number) => Promise<void>,
+): JevAsker {
   return {
-    async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
-      const response = await fetchFn(request.url, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      });
-      return parseJevResponse(response.status, response.ok, response.text);
+    ask(state, questions) {
+      return withRetry(
+        async () => {
+          const request = buildJevRequest({ apiKey, model }, state, questions);
+          const response = await fetchFn(request.url, {
+            method: request.method,
+            headers: request.headers,
+            body: request.body,
+          });
+          return parseJevResponse(response.status, response.ok, response.text);
+        },
+        { sleep },
+      );
     },
   };
 }
@@ -182,24 +218,39 @@ export function selectBackend(config: HookConfig): Exclude<Backend, 'auto'> {
   return config.backend;
 }
 
+/** The library options for the selected judge: the Claude judge gets wider windows unless set. */
+export function libraryOptions(config: HookConfig): CompactOptions {
+  if (selectBackend(config) !== 'claude') return config;
+  return {
+    ...config,
+    maxStateTokens: config.maxStateTokens ?? CLAUDE_STATE_TOKENS,
+    maxRequestTokens: config.maxRequestTokens ?? CLAUDE_REQUEST_TOKENS,
+  };
+}
+
+export type Judges = {
+  fetch: HookFetch;
+  complete?: Completer;
+  sleep?: (ms: number) => Promise<void>;
+};
+
 /** Builds the asker for the selected judge; throws when Jev is selected without a key. */
-export function pickAsker(config: HookConfig, fetchFn: HookFetch, complete?: Completer): JevAsker {
+export function pickAsker(config: HookConfig, judges: Judges): JevAsker {
   if (selectBackend(config) === 'claude') {
-    if (!complete) throw new Error('Claude judge needs $.model.complete');
-    return claudeAsker(complete, { model: config.claudeModel });
+    if (!judges.complete) throw new Error('Claude judge needs $.model.complete');
+    return claudeAsker(judges.complete, { model: config.claudeModel });
   }
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  return jevAsker(fetchFn, config.apiKey, config.model);
+  return jevAsker(judges.fetch, config.apiKey, config.model, judges.sleep);
 }
 
 /** Runs the library over a session transcript; throws when the judge is unavailable or fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
-  fetchFn: HookFetch,
-  complete?: Completer,
+  judges: Judges,
 ): Promise<SessionCompaction> {
-  const result = await compact(messages, pickAsker(config, fetchFn, complete), config);
+  const result = await compact(messages, pickAsker(config, judges), libraryOptions(config));
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -212,12 +263,15 @@ export function summarize(result: CompactResult): string {
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    stats.callsStubbed > 0 ? `${stats.callsStubbed} stubbed` : '',
+    stats.callsDropped > 0 ? `${stats.callsDropped} removed` : '',
+    stats.unscored > 0 ? `${stats.unscored} unscored` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.machineBlocksPruned > 0 ? `${stats.machineBlocksPruned} host blocks cut` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; ${stats.requests} request(s), largest state ~${stats.stateTokens} tokens, ${stats.ms} ms`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -255,13 +309,24 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
+/** Whether turn.complete should compact now, given the context percentage and what it did last. */
+export function shouldCompact(
+  percentUsed: number,
+  compactAtPercent: number,
+  memory: { armed: boolean; lastTriggered: number },
+): boolean {
+  if (percentUsed < compactAtPercent - REARM_PERCENT) memory.armed = true;
+  if (percentUsed < compactAtPercent) return false;
+  if (!memory.armed && percentUsed < memory.lastTriggered + REARM_PERCENT) return false;
+  memory.armed = false;
+  memory.lastTriggered = percentUsed;
+  return true;
+}
+
+type Env = { env: { get: (name: string) => Promise<string | undefined> } };
+type SettingsReader = { settings: { read: () => Promise<Readonly<Record<string, unknown>>> } };
+
+async function getApiKey($: Env & SettingsReader, config: HookConfig): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
   const fromEnv = await $.env.get('TYPESAFE_API_KEY');
   if (fromEnv) return fromEnv;
@@ -274,64 +339,104 @@ async function getApiKey(
   return undefined;
 }
 
-function notify(
-  $: {
-    ui: {
-      log: (text: string) => void;
-      toast: (text: string, options?: { timeoutMs?: number }) => void;
-    };
-  },
-  text: string,
-): void {
+type Ui = {
+  ui: {
+    log: (text: string) => void;
+    toast: (text: string, options?: { timeoutMs?: number }) => void;
+  };
+};
+
+function notify($: Ui, text: string, quiet: boolean): void {
   $.ui.log(text);
-  $.ui.toast(text, { timeoutMs: 15_000 });
+  if (!quiet) $.ui.toast(text, { timeoutMs: 15_000 });
+}
+
+type Recorder = Env & {
+  clock: { now: () => Promise<number> };
+  fs: {
+    exists: (path: string) => Promise<boolean>;
+    read: (path: string) => Promise<string>;
+    write: (path: string, text: string) => Promise<void>;
+  };
+  store: { set: (key: string, value: unknown) => Promise<void> };
+};
+
+/** Appends one line to `~/.claude/fast-jev-compaction.log` and keeps the last outcome in the store; never throws. */
+async function record($: Recorder, line: string): Promise<void> {
+  try {
+    const stamp = new Date(await $.clock.now()).toISOString();
+    await $.store.set('lastCompaction', { at: stamp, line });
+    const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'));
+    if (!home) return;
+    const path = `${home}/.claude/fast-jev-compaction.log`;
+    const previous = (await $.fs.exists(path)) ? await $.fs.read(path) : '';
+    const lines = previous.split('\n').filter(Boolean).slice(-(LOG_LINES - 1));
+    lines.push(`${stamp} ${line}`);
+    await $.fs.write(path, `${lines.join('\n')}\n`);
+  } catch {
+    // a log line is never worth failing a compaction
+  }
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  const memory = { armed: true, lastTriggered: 0 };
 
   on('session.compact', async ($, event, next) => {
+    const quiet = event.trigger === 'precompute' || event.agentId !== undefined;
+    const tag = `[${event.trigger}${event.agentId ? ` ${event.agentId}` : ''}]`;
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(
-        event.messages,
-        config,
-        async (url, init) => {
+      const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
+      if (event.instructions) {
+        config.goal = config.goal ? `${event.instructions}\n${config.goal}` : event.instructions;
+      }
+      const backend = selectBackend(config);
+      const share = prunableShare(event.messages, libraryOptions(config));
+      if (share < config.minReductionRatio) {
+        const line = `${tag} ${percent(share)} of the history is prunable (below ${percent(
+          config.minReductionRatio,
+        )} minimum)`;
+        if (event.trigger === 'auto' || config.nothingToPrune === 'summary') {
+          notify($, `${line}; built-in summary`, quiet);
+          await record($, `${line}; built-in summary`);
+          return next(event);
+        }
+        notify($, `${line}; history left unchanged`, quiet);
+        await record($, `${line}; history left unchanged`);
+        return { messages: event.messages };
+      }
+      const { result, messages } = await compactSession(event.messages, config, {
+        fetch: async (url, init) => {
           const response = await $.http.fetch(url, init);
           return { status: response.status, ok: response.ok, text: response.text };
         },
-        (request) => $.model.complete(request),
-      );
+        complete: (request) => $.model.complete(request),
+        sleep: (ms) => $.clock.sleep(ms),
+      });
       for (const line of decisionLogLines(result)) $.ui.log(line);
-      if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
-        return next(event);
-      }
-      notify(
-        $,
-        `[${selectBackend(config)}] kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
-      );
+      const line = `${tag} [${backend}] kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(
+        result,
+      )})`;
+      notify($, line, quiet);
+      await record($, line);
       return { messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      notify($, `${tag} fallback to built-in summary (${reason})`, quiet);
+      await record($, `${tag} fallback to built-in summary (${reason})`);
       return next(event);
     }
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    if (compacting || event.agentId !== undefined) return next(event);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      if (!shouldCompact(context.percent ?? 0, configured.compactAtPercent, memory)) return next(event);
       compacting = true;
-      await $.session.compact();
+      const outcome = await $.session.compact();
+      if (outcome.skip) $.ui.log(`auto-compact skipped (${outcome.skip})`);
     } catch (error) {
       $.ui.log(
         `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,

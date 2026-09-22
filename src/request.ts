@@ -78,3 +78,38 @@ export function noulAnswer(
   }
   return answer.noul;
 }
+
+/** Failures worth one more try: rate limits, server errors, a dropped connection. */
+const RETRYABLE = /\((429|5\d\d)\)|fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|socket|network/i;
+
+export function isRetryable(error: unknown): boolean {
+  return RETRYABLE.test(error instanceof Error ? error.message : String(error));
+}
+
+/** A pause on the host timer, or none where the module has no timer. */
+function defaultSleep(ms: number): Promise<void> {
+  const timer = (globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown }).setTimeout;
+  return new Promise<void>((resolve) => (timer ? timer(resolve, ms) : resolve()));
+}
+
+/** Runs `fn`, retrying a retryable failure `retries` times with a growing pause. */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: {
+    retries?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<T> {
+  const retries = options.retries ?? 1;
+  const delayMs = options.delayMs ?? 1500;
+  const sleep = options.sleep ?? defaultSleep;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (attempt >= retries || !isRetryable(error)) throw error;
+      await sleep(delayMs * (attempt + 1));
+    }
+  }
+}
