@@ -1,4 +1,4 @@
-import { noulAnswer } from './request.js';
+import { choiceAnswer, noulAnswer } from './request.js';
 import {
   collectToolCalls,
   estimateTokens,
@@ -35,6 +35,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   pruneMachineText: true,
   concurrency: 4,
   arbitrateBand: 0.15,
+  primitive: 'noul',
 };
 
 function finite(value: number | undefined, fallback: number): number {
@@ -62,6 +63,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         : DEFAULT_OPTIONS.pruneMachineText,
     concurrency: whole(options.concurrency, DEFAULT_OPTIONS.concurrency, 1),
     arbitrateBand: Math.max(0, finite(options.arbitrateBand, DEFAULT_OPTIONS.arbitrateBand)),
+    primitive: options.primitive === 'choice' ? 'choice' : DEFAULT_OPTIONS.primitive,
   };
 }
 
@@ -74,6 +76,43 @@ export function askResult(
 }
 
 /**
+ * The `choice` question asked about one call: one question whose options are
+ * the actions themselves, so the judge compares them instead of estimating
+ * two truths. The criteria carry the same wording the `noul` questions were
+ * calibrated on. A call whose result is too short to be worth asking about
+ * gets the two-option form.
+ */
+export function choiceQuestionFor(
+  call: Pick<ToolCall, 'id' | 'tool' | 'resultChars' | 'tombstone'>,
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
+): JevQuestions {
+  const stub = `Neither the call nor its output is still needed: routine exploration, or superseded by later work`;
+  if (!askResult(call, options)) {
+    return {
+      [`call_${call.id}`]: {
+        type: 'choice',
+        instructions: `How much of tool call ${call.id} (${call.tool}) the current task still needs`,
+        criteria: {
+          keep: `The call still matters: a file or command the assistant is working with, a decision, a constraint, or an edit that was made`,
+          stub,
+        },
+      },
+    };
+  }
+  return {
+    [`call_${call.id}`]: {
+      type: 'choice',
+      instructions: `How much of tool call ${call.id} (${call.tool}, ${call.resultChars} chars of output) the current task still needs`,
+      criteria: {
+        keep_result: `The full output is still needed to continue the current task correctly (an error message, a value, file contents being edited, a constraint), beyond what re-running the tool would give`,
+        keep: `The call itself carries information the task still depends on (the file or command it names, the decision or the edit it made), but its full output is not needed again`,
+        stub,
+      },
+    },
+  };
+}
+
+/**
  * The `noul` questions asked about one call: keep the call; keep its full
  * result, when that is a choice. Each spells its criterion out, although the
  * state's context states it too: measured on a real transcript
@@ -83,8 +122,9 @@ export function askResult(
  */
 export function questionsFor(
   call: Pick<ToolCall, 'id' | 'tool' | 'resultChars' | 'tombstone'>,
-  options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars' | 'primitive'>,
 ): JevQuestions {
+  if (options.primitive === 'choice') return choiceQuestionFor(call, options);
   const questions: JevQuestions = {
     [`call_${call.id}`]: {
       type: 'noul',
@@ -102,7 +142,7 @@ export function questionsFor(
 
 export function questionTokens(
   call: Pick<ToolCall, 'id' | 'tool' | 'resultChars' | 'tombstone'>,
-  options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars' | 'primitive'>,
 ): number {
   return estimateTokens(JSON.stringify(questionsFor(call, options)));
 }
@@ -138,7 +178,7 @@ export function decideCall(
 async function askRequest(
   asker: JevAsker,
   request: PlannedRequest,
-  options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars' | 'primitive'>,
 ): Promise<Map<string, CallAnswer>> {
   const questions: JevQuestions = Object.assign(
     {},
@@ -147,6 +187,11 @@ async function askRequest(
   const { answers } = await asker.ask(request.state, questions, request.calls);
   const scored = new Map<string, CallAnswer>();
   for (const call of request.calls) {
+    if (options.primitive === 'choice') {
+      const answer = choiceAnswer(answers, `call_${call.id}`);
+      if (answer) scored.set(call.id, answer);
+      continue;
+    }
     const keepCall = noulAnswer(answers, `call_${call.id}`);
     if (keepCall === undefined) continue;
     if (!askResult(call, options)) {

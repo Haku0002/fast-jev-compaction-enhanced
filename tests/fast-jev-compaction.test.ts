@@ -3,6 +3,7 @@ import {
   abridgeInput,
   applyDecisions,
   buildJevRequest,
+  choiceAnswer,
   collectToolCalls,
   compact,
   compactMessages,
@@ -118,6 +119,7 @@ describe('options', () => {
       pruneMachineText: true,
       concurrency: 4,
       arbitrateBand: 0.15,
+      primitive: 'noul',
     });
     expect(
       resolveOptions({
@@ -765,5 +767,51 @@ describe('HTTP client', () => {
     await expect(
       compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
     ).rejects.toThrow(/TYPESAFE_API_KEY/);
+  });
+});
+
+describe('choice primitive', () => {
+  const options = resolveOptions({ primitive: 'choice' });
+  const long = { id: 't1', tool: 'Read', resultChars: 5000, tombstone: false };
+  const short = { id: 't2', tool: 'Bash', resultChars: 40, tombstone: false };
+
+  it('asks one question per call whose options are the actions', () => {
+    const three = questionsFor(long, options);
+    expect(Object.keys(three)).toEqual(['call_t1']);
+    const q = three['call_t1']!;
+    expect(q.type).toBe('choice');
+    expect(q.type === 'choice' && Object.keys(q.criteria)).toEqual(['keep_result', 'keep', 'stub']);
+    const two = questionsFor(short, options)['call_t2']!;
+    expect(two.type === 'choice' && Object.keys(two.criteria)).toEqual(['keep', 'stub']);
+  });
+
+  it('keeps noul as the default', () => {
+    expect(resolveOptions().primitive).toBe('noul');
+    expect(questionsFor(long, resolveOptions())['call_t1']!.type).toBe('noul');
+  });
+
+  it('reads keepCall as 1 - P(stub) and keepResult as P(keep_result) given not stubbed', () => {
+    const answers = {
+      call_t1: { type: 'choice' as const, choice: 'keep', confidence: 0.4, probabilities: { keep_result: 0.4, keep: 0.4, stub: 0.2 } },
+    };
+    const read = choiceAnswer(answers, 'call_t1')!;
+    expect(read.keepCall).toBeCloseTo(0.8);
+    expect(read.keepResult).toBeCloseTo(0.5);
+  });
+
+  it('gives keepResult 0 for the two-option form and nothing for a missing answer', () => {
+    const answers = {
+      call_t2: { type: 'choice' as const, choice: 'keep', confidence: 0.7, probabilities: { keep: 0.7, stub: 0.3 } },
+    };
+    expect(choiceAnswer(answers, 'call_t2')).toEqual({ keepCall: expect.closeTo(0.7), keepResult: 0 });
+    expect(choiceAnswer(answers, 'call_t9')).toBeUndefined();
+    expect(choiceAnswer({ call_t3: { noul: 0.5 } }, 'call_t3')).toBeUndefined();
+  });
+
+  it('does not divide by zero when the judge is sure to stub', () => {
+    const answers = {
+      call_t1: { type: 'choice' as const, choice: 'stub', confidence: 1, probabilities: { keep_result: 0, keep: 0, stub: 1 } },
+    };
+    expect(choiceAnswer(answers, 'call_t1')).toEqual({ keepCall: 0, keepResult: 0 });
   });
 });

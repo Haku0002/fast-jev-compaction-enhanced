@@ -175,6 +175,25 @@ export interface CompactOptions {
   arbiter?: JevAsker;
   /** Half-width of the band around a threshold that goes to the arbiter. Default 0.15. */
   arbitrateBand?: number;
+
+  /**
+   * Which System One primitive the judge is asked with. `noul` asks two
+   * yes/no questions per call (keep the call; keep its full result) and
+   * thresholds each probability. `choice` asks one question per call whose
+   * options are the actions themselves, and reads the two probabilities back
+   * off the distribution: `keepCall` is `1 - P(stub)` and `keepResult` is
+   * `P(keep_result | not stub)`, so every threshold downstream keeps its
+   * meaning. Default `noul`.
+   *
+   * Measured on 2026-09-25 against what three real sessions did after a cut
+   * (`npm run evaluate`, 1412 calls): `choice` commits far more (29% of
+   * calls near 0.5 against 60%), but at the default thresholds it stubbed
+   * 56% of the calls the session went on to use, against 21% for `noul`.
+   * Stubbing the same number of calls, the two rank about alike. Neither
+   * `keepResult` predicted which outputs were used again (pooled AUC 0.38),
+   * and a rule on the tool name alone lost fewer needed calls than either.
+   */
+  primitive?: 'noul' | 'choice';
 }
 
 export interface ResolvedCompactOptions {
@@ -190,6 +209,7 @@ export interface ResolvedCompactOptions {
   pruneMachineText: boolean;
   concurrency: number;
   arbitrateBand: number;
+  primitive: 'noul' | 'choice';
 }
 
 export interface CompactStats {

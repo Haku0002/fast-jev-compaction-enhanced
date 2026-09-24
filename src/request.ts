@@ -110,6 +110,36 @@ export function noulAnswer(
   return answer.noul;
 }
 
+/**
+ * The two probabilities a `choice` answer carries, or `undefined` when the
+ * judge left the question unanswered or answered it without a usable
+ * distribution. The options are the actions themselves, so the distribution
+ * already holds both numbers the thresholds want, read as the nested decision
+ * they are: a call is worth keeping at all with `1 - P(stub)`, and, given
+ * that, its full result is worth keeping with `P(keep_result) / (1 -
+ * P(stub))`. The conditional is the one that matches what the `noul`
+ * question asked, so `keepThreshold` keeps its meaning; the raw share would
+ * be diluted by the third option. A two-option question (no result worth
+ * asking about) has no `keep_result`, and `keepResult` is then 0.
+ */
+export function choiceAnswer(
+  answers: Record<string, JevAnswer>,
+  name: string,
+): { keepCall: number; keepResult: number } | undefined {
+  const answer = answers[name];
+  if (!answer || !('probabilities' in answer) || answer.probabilities === null) return undefined;
+  const p = answer.probabilities as Record<string, unknown>;
+  const at = (key: string): number => {
+    const value = p[key];
+    return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+  };
+  if (!('stub' in p)) return undefined;
+  const keepCall = Math.min(1, Math.max(0, 1 - at('stub')));
+  if (!('keep_result' in p)) return { keepCall, keepResult: 0 };
+  const keepResult = keepCall > 0 ? Math.min(1, at('keep_result') / keepCall) : 0;
+  return { keepCall, keepResult };
+}
+
 /** Failures worth one more try: rate limits, server errors, a dropped connection, a timeout. */
 const RETRYABLE = /\((429|5\d\d)\)|fetch failed|ECONN|ETIMEDOUT|EAI_AGAIN|socket|network|timed out/i;
 
