@@ -34,6 +34,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   stubChars: 120,
   pruneMachineText: true,
   concurrency: 4,
+  arbitrateBand: 0.15,
 };
 
 function finite(value: number | undefined, fallback: number): number {
@@ -60,6 +61,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         ? options.pruneMachineText
         : DEFAULT_OPTIONS.pruneMachineText,
     concurrency: whole(options.concurrency, DEFAULT_OPTIONS.concurrency, 1),
+    arbitrateBand: Math.max(0, finite(options.arbitrateBand, DEFAULT_OPTIONS.arbitrateBand)),
   };
 }
 
@@ -71,7 +73,14 @@ export function askResult(
   return !call.tombstone && call.resultChars > options.truncateHeadChars + 120;
 }
 
-/** The `noul` questions asked about one call: keep the call; keep its full result, when that is a choice. */
+/**
+ * The `noul` questions asked about one call: keep the call; keep its full
+ * result, when that is a choice. Each spells its criterion out, although the
+ * state's context states it too: measured on a real transcript
+ * (`npm run calibrate`), a one-line question that leaned on the context
+ * alone pulled every probability down by about 0.3 and flipped two thirds
+ * of the decisions, so the longer wording is the calibrated one.
+ */
 export function questionsFor(
   call: Pick<ToolCall, 'id' | 'tool' | 'resultChars' | 'tombstone'>,
   options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
@@ -108,17 +117,24 @@ export function decideCall(
 ): CallDecision {
   const base = { id: call.id, tool: call.tool, ...answer };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
-  if (askResult(call, options) && answer.keepResult >= options.keepThreshold) {
+  const asked = askResult(call, options);
+  if (asked && answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
   if (answer.keepCall >= options.keepCallThreshold) {
-    return { ...base, action: 'drop_result', reason: 'result_dropped' };
+    // A result too short to cut is kept as it is; `drop_result` then only bounds the input.
+    return { ...base, action: 'drop_result', reason: asked ? 'result_dropped' : 'kept' };
   }
   return options.dropCalls === 'delete'
     ? { ...base, action: 'drop_call', reason: 'call_dropped' }
     : { ...base, action: 'stub_call', reason: 'call_stubbed' };
 }
 
+/**
+ * Asks one request and maps the answers back to its calls. A call the judge
+ * left unanswered (either of its questions) is absent from the map, and so
+ * stays unscored; a reply that answers none of the questions is an error.
+ */
 async function askRequest(
   asker: JevAsker,
   request: PlannedRequest,
@@ -128,19 +144,69 @@ async function askRequest(
     {},
     ...request.calls.map((call) => questionsFor(call, options)),
   );
-  const { answers } = await asker.ask(request.state, questions);
-  return new Map(
-    request.calls.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: askResult(call, options) ? noulAnswer(answers, `result_${call.id}`) : 0,
-      },
-    ]),
-  );
+  const { answers } = await asker.ask(request.state, questions, request.calls);
+  const scored = new Map<string, CallAnswer>();
+  for (const call of request.calls) {
+    const keepCall = noulAnswer(answers, `call_${call.id}`);
+    if (keepCall === undefined) continue;
+    if (!askResult(call, options)) {
+      scored.set(call.id, { keepCall, keepResult: 0 });
+      continue;
+    }
+    const keepResult = noulAnswer(answers, `result_${call.id}`);
+    if (keepResult === undefined) continue;
+    scored.set(call.id, { keepCall, keepResult });
+  }
+  if (scored.size === 0 && request.calls.length > 0) {
+    throw new Error(`Invalid Jev answers: none of ${Object.keys(questions).length} questions answered`);
+  }
+  return scored;
 }
 
-/** Runs `fn` over `items` with at most `limit` in flight; rejects on the first failure. */
+/** Whether an answer sits close enough to a threshold to be worth a second opinion. */
+export function isBorderline(
+  call: Pick<ToolCall, 'resultChars' | 'tombstone'>,
+  answer: CallAnswer,
+  options: Pick<ResolvedCompactOptions, 'keepThreshold' | 'keepCallThreshold' | 'truncateHeadChars' | 'arbitrateBand'>,
+): boolean {
+  if (options.arbitrateBand <= 0) return false;
+  if (Math.abs(answer.keepCall - options.keepCallThreshold) < options.arbitrateBand) return true;
+  return askResult(call, options) && Math.abs(answer.keepResult - options.keepThreshold) < options.arbitrateBand;
+}
+
+/**
+ * Puts the borderline calls of each request to the arbiter, with the same
+ * state the judge saw, and returns the arbiter's answers by call id. A call
+ * the arbiter leaves unanswered keeps the judge's answer. Requests without a
+ * borderline call cost nothing.
+ */
+async function arbitrate(
+  arbiter: JevAsker,
+  requests: readonly PlannedRequest[],
+  answers: ReadonlyMap<string, CallAnswer>,
+  options: ResolvedCompactOptions,
+): Promise<Map<string, CallAnswer>> {
+  const overrides = new Map<string, CallAnswer>();
+  const work = requests
+    .map((request) => ({
+      state: request.state,
+      calls: request.calls.filter((call) => {
+        const answer = answers.get(call.id);
+        return answer !== undefined && isBorderline(call, answer, options);
+      }),
+    }))
+    .filter((request) => request.calls.length > 0);
+  const answered = await runLimited(work, options.concurrency, (request) =>
+    askRequest(arbiter, { state: request.state, calls: request.calls, tokens: 0 }, options),
+  );
+  for (const map of answered) for (const [id, answer] of map) overrides.set(id, answer);
+  return overrides;
+}
+
+/**
+ * Runs `fn` over `items` with at most `limit` in flight; rejects on the first
+ * failure, and the other workers stop taking new items once one has failed.
+ */
 async function runLimited<T, R>(
   items: readonly T[],
   limit: number,
@@ -148,21 +214,39 @@ async function runLimited<T, R>(
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
   let next = 0;
+  let failed = false;
   const worker = async (): Promise<void> => {
-    while (next < items.length) {
+    while (!failed && next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await fn(items[index]!);
+      try {
+        results[index] = await fn(items[index]!);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
 }
 
-function truncatedResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
-  const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+/** How `keepChars` of a cut result are split: two thirds head, one third tail (where a command's verdict is). */
+export function headTail(keepChars: number): { head: number; tail: number } {
+  const tail = Math.floor(keepChars / 3);
+  return { head: keepChars - tail, tail };
+}
+
+/**
+ * A dropped result as the history keeps it: its head, its tail and a note,
+ * the note last so a later round recognises it (`isTombstone`).
+ */
+function truncatedResultText(text: string, isError: boolean, keepChars: number): string {
+  if (text.length <= keepChars + 120) return text;
+  const { head, tail } = headTail(keepChars);
+  const omitted = text.length - head - tail;
+  const kept = keepChars > 0 ? `${text.slice(0, head)}\n[…]\n${tail > 0 ? `${text.slice(-tail)}\n` : ''}` : '';
+  return `${kept}[fast-jev-compaction truncated ${omitted} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }
@@ -210,11 +294,6 @@ export function stubInput(input: Record<string, unknown>, chars: number): Record
   let changed = false;
   for (const [key, value] of Object.entries(input)) {
     const text = typeof value === 'string' ? value : safeJson(value);
-    if (text.length <= budget && typeof value === 'string') {
-      out[key] = value;
-      budget -= text.length;
-      continue;
-    }
     if (text.length <= budget) {
       out[key] = value;
       budget -= text.length;
@@ -250,8 +329,8 @@ export interface Applied {
 
 /**
  * Rebuilds the conversation from the decisions. A dropped result keeps a
- * bounded head and note and its input's oversized fields are cut; a stub
- * keeps the tool name with a short input and a note for the result; a
+ * bounded head, tail and note and its input's oversized fields are cut; a
+ * stub keeps the tool name with a short input and a note for the result; a
  * deleted call disappears with its result and marks the turn's narration.
  * Old user messages lose the bulk of their host blocks. Messages that lose
  * all their content are removed; untouched messages are returned as the
@@ -404,7 +483,6 @@ export async function compact(
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let requests: PlannedRequest[] = [];
-  let unscored = new Set<string>();
   const answers = new Map<string, CallAnswer>();
   if (candidates.length > 0) {
     const plan = planRequests(messages, calls, candidates, {
@@ -412,20 +490,29 @@ export async function compact(
       questionTokens: (call) => questionTokens(call, resolved),
     });
     requests = plan.requests;
-    unscored = new Set(plan.unscored.map((call) => call.id));
     const answered = await runLimited(requests, resolved.concurrency, (request) =>
       askRequest(asker, request, resolved),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
+  const overrides =
+    options.arbiter && answers.size > 0 ? await arbitrate(options.arbiter, requests, answers, resolved) : new Map<string, CallAnswer>();
+  let arbiterFlips = 0;
+
   const decisions = calls.map((call): CallDecision => {
-    if (call.pinned) return decideCall(call, { keepCall: 1, keepResult: 1 }, resolved);
+    const about = { resultAsked: askResult(call, resolved), resultChars: call.resultChars, about: briefInput(call.input) };
+    if (call.pinned) return { ...decideCall(call, { keepCall: 1, keepResult: 1 }, resolved), ...about };
     const answer = answers.get(call.id);
-    if (!answer || unscored.has(call.id)) {
-      return { id: call.id, tool: call.tool, keepCall: 1, keepResult: 1, action: 'keep', reason: 'unscored' };
+    if (!answer) {
+      return { id: call.id, tool: call.tool, keepCall: 1, keepResult: 1, action: 'keep', reason: 'unscored', ...about };
     }
-    return decideCall(call, answer, resolved);
+    const override = overrides.get(call.id);
+    if (!override) return { ...decideCall(call, answer, resolved), ...about };
+    const judged = decideCall(call, answer, resolved);
+    const decision = { ...decideCall(call, override, resolved), ...about, judged: answer };
+    if (decision.action !== judged.action) arbiterFlips += 1;
+    return decision;
   });
   const applied = applyDecisions(messages, decisions, calls, resolved);
   return {
@@ -447,6 +534,8 @@ export async function compact(
       machineBlocksPruned: applied.machineBlocksPruned,
       stateTokens: requests.reduce((max, request) => Math.max(max, request.tokens), 0),
       requests: requests.length,
+      arbitrated: overrides.size,
+      arbiterFlips,
       ms: Date.now() - started,
     },
   };

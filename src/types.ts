@@ -46,11 +46,19 @@ export interface ToolCall {
   resultChars: number;
   /** The first characters of the result, whitespace collapsed, for the state. */
   resultHead: string;
+  /** The last characters of the result, whitespace collapsed, for the state. */
+  resultTail: string;
   isError: boolean;
   /** The result is a note an earlier compaction round left, not tool output. */
   tombstone: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
+  /**
+   * The id of the next later call on the same target (the same file, the same
+   * command, the same search), when there is one: a hint to the judge that
+   * this call's output was probably superseded.
+   */
+  supersededBy?: string;
 }
 
 export interface CallAnswer {
@@ -62,12 +70,16 @@ export interface CallAnswer {
 
 /**
  * `keep` leaves the call and its result as they are; `drop_result` keeps the
- * call with a bounded input and the head of its result; `stub_call` keeps
- * only the tool name, a short input and a note in place of the result;
+ * call with a bounded input and the head and tail of its result; `stub_call`
+ * keeps only the tool name, a short input and a note in place of the result;
  * `drop_call` removes the call and its result and marks the narration.
  */
 export type CallAction = 'keep' | 'drop_result' | 'stub_call' | 'drop_call';
 
+/**
+ * `kept` covers a result kept verbatim and a call whose result was too short
+ * to cut (its action is then `drop_result`, which only bounds the input).
+ */
 export type CallReason =
   | 'pinned'
   | 'unscored'
@@ -81,6 +93,18 @@ export interface CallDecision extends CallAnswer {
   tool: string;
   action: CallAction;
   reason: CallReason;
+  /** Whether the result question was asked at all; `keepResult` is 0 when not. */
+  resultAsked?: boolean;
+  /** Characters of the result before the round. */
+  resultChars?: number;
+  /** The first string field of the input, collapsed, for a log line. */
+  about?: string;
+  /**
+   * The judge's own answer when an arbiter overrode it: `keepCall` and
+   * `keepResult` above are then the arbiter's. Absent when no arbiter was
+   * asked about this call.
+   */
+  judged?: CallAnswer;
 }
 
 export interface HistoryToolCall {
@@ -88,6 +112,8 @@ export interface HistoryToolCall {
   tool: string;
   input: string;
   result: string;
+  /** A later call on the same target, as `t41 Edit`. */
+  superseded_by?: string;
 }
 
 export interface HistoryEntry {
@@ -130,7 +156,7 @@ export interface CompactOptions {
   maxStateTokens?: number;
   /** Estimated token ceiling for one request's state plus its questions. Default 30000. */
   maxRequestTokens?: number;
-  /** Characters of a dropped tool result, or of an oversized input field, to retain. Default 300. */
+  /** Characters of a dropped tool result (head and tail together), or of an oversized input field, to retain. Default 300. */
   truncateHeadChars?: number;
   /** `stub` (default) keeps a stub of a call judged unneeded; `delete` removes it and marks the narration. */
   dropCalls?: DropCalls;
@@ -140,6 +166,15 @@ export interface CompactOptions {
   pruneMachineText?: boolean;
   /** Jev requests in flight at once. Default 4. */
   concurrency?: number;
+  /**
+   * A second judge for the calls the first was unsure about: every call
+   * whose `keepCall` (or asked `keepResult`) lands within `arbitrateBand` of
+   * its threshold is put to the arbiter again, with the same window, and the
+   * arbiter's answer replaces the judge's. None by default.
+   */
+  arbiter?: JevAsker;
+  /** Half-width of the band around a threshold that goes to the arbiter. Default 0.15. */
+  arbitrateBand?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -154,6 +189,7 @@ export interface ResolvedCompactOptions {
   stubChars: number;
   pruneMachineText: boolean;
   concurrency: number;
+  arbitrateBand: number;
 }
 
 export interface CompactStats {
@@ -169,13 +205,16 @@ export interface CompactStats {
   callsStubbed: number;
   callsDropped: number;
   pinned: number;
-  /** Candidates no request could show; kept untouched. */
+  /** Candidates no request could show, or the judge left unanswered; kept untouched. */
   unscored: number;
   /** Old user messages whose machine-generated blocks were cut. */
   machineBlocksPruned: number;
   /** Estimated tokens of the largest request state. */
   stateTokens: number;
   requests: number;
+  /** Calls the arbiter was asked about, and how many of those changed action. */
+  arbitrated: number;
+  arbiterFlips: number;
   ms: number;
 }
 
@@ -244,7 +283,11 @@ export interface JevResponse {
   [key: string]: unknown;
 }
 
-/** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
+/**
+ * Anything that can answer Jev questions: `JevClient`, or a host-provided
+ * adapter. `calls` are the candidates the questions are about, for an asker
+ * that needs their `tool_use_id`s (the fork judge); the HTTP client ignores it.
+ */
 export interface JevAsker {
-  ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;
+  ask(state: JevState, questions: JevQuestions, calls?: readonly ToolCall[]): Promise<JevResponse>;
 }

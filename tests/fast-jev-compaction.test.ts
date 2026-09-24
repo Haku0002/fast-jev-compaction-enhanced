@@ -9,18 +9,26 @@ import {
   decideCall,
   estimateTokens,
   goalFromMessages,
+  headTail,
+  isBorderline,
   isRetryable,
+  isTombstone,
   JevClient,
+  JevRequestError,
   parseJevResponse,
+  parseClaudeReply,
   planRequests,
+  replyText,
   prunableShare,
   pruneMachineBlocks,
   questionsFor,
   questionTokens,
   reductionRatio,
   resolveOptions,
+  retryAfterMs,
   stubInput,
   withRetry,
+  withTimeout,
   type HistoryToolCall,
   type JevAsker,
   type JevQuestions,
@@ -109,6 +117,7 @@ describe('options', () => {
       stubChars: 120,
       pruneMachineText: true,
       concurrency: 4,
+      arbitrateBand: 0.15,
     });
     expect(
       resolveOptions({
@@ -163,6 +172,10 @@ describe('tool call collection', () => {
     const note = `${'x'.repeat(300)}\n[fast-jev-compaction truncated 1700 chars of this tool result; re-run the tool if needed]`;
     const calls = collectToolCalls([message('user', 'hi'), call('x', 'Read', {}, note), result('x', note)], 0);
     expect(calls[0]?.tombstone).toBe(true);
+    // A file that merely quotes the note (this test file, say) is tool output, not a note.
+    const quoting = `${note}\n\nexpect(text).toBe('...');\n`;
+    const read = collectToolCalls([message('user', 'hi'), call('y', 'Read', {}, quoting), result('y', quoting)], 0);
+    expect(read[0]?.tombstone).toBe(false);
   });
 });
 
@@ -210,8 +223,72 @@ describe('request planning', () => {
     expect(state.history.map((entry) => entry.i)).toEqual([0, 1, 3, 4, 6, 8, 9]);
     const first = state.history[1]?.tool_calls?.[0] as HistoryToolCall;
     expect(first).toMatchObject({ id: 't1', tool: 'Read', input: JSON.stringify({ file_path: 'src/a.ts' }) });
-    expect(first.result).toMatch(/^export const a = 1; .*… \(ok, 1000 chars\)$/);
+    expect(first.result).toMatch(/^export const a = 1; .*… .*export const a = 1; \(ok, 1000 chars\)$/);
     expect((state.history[4]?.tool_calls?.[0] as HistoryToolCall).result).toMatch(/\(error\)$/);
+  });
+
+  it('shows the tail of a long output, where a command reports its verdict', () => {
+    const output = `${'RUN  v2.1.9\n✓ passes\n'.repeat(60)}\nFAIL src/b.test.ts > expected 2 to be 3\nTests 1 failed | 59 passed`;
+    const messages = [message('user', 'start'), call('c', 'Bash', { command: 'npm test' }, output), result('c', output, true)];
+    const calls = collectToolCalls(messages, 0);
+    const { requests } = planRequests(messages, calls, calls, planOptions());
+    const shown = (requests[0]?.state.history[1]?.tool_calls?.[0] as HistoryToolCall).result;
+    expect(shown).toMatch(/^RUN v2\.1\.9 .*… .*FAIL src\/b\.test\.ts > expected 2 to be 3 Tests 1 failed \| 59 passed \(error, \d+ chars\)$/);
+    expect(shown.length).toBeLessThan(300);
+  });
+
+  it('tells the judge when a later call targets the same file, command or search', () => {
+    const messages = [
+      message('user', 'start'),
+      call('r1', 'Read', { file_path: 'src/a.ts' }, 'v1'),
+      result('r1', 'v1'),
+      call('g1', 'Grep', { pattern: 'foo', path: 'src' }, 'a.ts:1'),
+      result('g1', 'a.ts:1'),
+      call('e1', 'Edit', { file_path: 'src/a.ts', old_string: 'v1', new_string: 'v2' }, 'ok'),
+      result('e1', 'ok'),
+      call('b1', 'Bash', { command: 'npm test' }, 'FAIL'),
+      result('b1', 'FAIL'),
+      call('r2', 'Read', { file_path: 'src/a.ts' }, 'v2'),
+      result('r2', 'v2'),
+      call('b2', 'Bash', { command: 'npm test' }, 'PASS'),
+      result('b2', 'PASS'),
+      call('g2', 'Grep', { pattern: 'foo', path: 'lib' }, ''),
+      result('g2', ''),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    expect(calls.map((c) => [c.id, c.supersededBy])).toEqual([
+      ['t1', 't3'],
+      ['t2', undefined],
+      ['t3', 't5'],
+      ['t4', 't6'],
+      ['t5', undefined],
+      ['t6', undefined],
+      ['t7', undefined],
+    ]);
+    const { requests } = planRequests(messages, calls, calls, planOptions());
+    const shown = requests[0]!.state.history.flatMap((entry) => (entry.tool_calls ?? []) as HistoryToolCall[]);
+    expect(shown.find((c) => c.id === 't1')?.superseded_by).toBe('t3 Edit');
+    expect(shown.find((c) => c.id === 't4')?.superseded_by).toBe('t6 Bash');
+    expect(shown.find((c) => c.id === 't2')?.superseded_by).toBeUndefined();
+    expect(JSON.stringify(requests[0]!.state.context)).toContain('superseded_by');
+  });
+
+  it('does not let two reads of different parts of a file supersede each other, but an edit supersedes both', () => {
+    const messages = [
+      message('user', 'start'),
+      call('a', 'Read', { file_path: 'src/a.ts', offset: 0, limit: 50 }, 'head'),
+      result('a', 'head'),
+      call('b', 'Read', { file_path: 'src/a.ts', offset: 500, limit: 50 }, 'middle'),
+      result('b', 'middle'),
+      call('c', 'Read', { file_path: 'src/a.ts', offset: 0, limit: 50 }, 'head again'),
+      result('c', 'head again'),
+      call('d', 'Edit', { file_path: 'src/a.ts', old_string: 'x', new_string: 'y' }, 'ok'),
+      result('d', 'ok'),
+      call('e', 'Read', { file_path: 'src/a.ts', offset: 500, limit: 50 }, 'middle again'),
+      result('e', 'middle again'),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    expect(calls.map((c) => c.supersededBy)).toEqual(['t3', 't4', 't4', undefined, undefined]);
   });
 
   it('defaults the goal to the latest human prompts', () => {
@@ -267,16 +344,24 @@ describe('questions and decisions', () => {
     expect(Object.keys(questionsFor(small, defaults))).toEqual(['call_t1']);
     expect(Object.keys(questionsFor(tombstone, defaults))).toEqual(['call_t1']);
     expect(questionsFor(large, defaults).call_t1?.instructions).toContain('still depends on');
+    expect(questionsFor(large, defaults).result_t1?.instructions).toContain('re-running the tool');
   });
 
   it('keeps, truncates, stubs or removes by the two thresholds', () => {
     expect(decideCall(large, { keepCall: 0.9, keepResult: 0.7 }, defaults).action).toBe('keep');
-    expect(decideCall(large, { keepCall: 0.9, keepResult: 0.2 }, defaults).action).toBe('drop_result');
+    expect(decideCall(large, { keepCall: 0.9, keepResult: 0.2 }, defaults)).toMatchObject({
+      action: 'drop_result',
+      reason: 'result_dropped',
+    });
     expect(decideCall(large, { keepCall: 0.1, keepResult: 0.2 }, defaults).action).toBe('stub_call');
     expect(decideCall(large, { keepCall: 0.1, keepResult: 0.2 }, { ...defaults, dropCalls: 'delete' }).action).toBe(
       'drop_call',
     );
-    expect(decideCall(small, { keepCall: 0.9, keepResult: 0.9 }, defaults).action).toBe('drop_result');
+    // A result too short to cut counts as kept, even though the action bounds the input.
+    expect(decideCall(small, { keepCall: 0.9, keepResult: 0.9 }, defaults)).toMatchObject({
+      action: 'drop_result',
+      reason: 'kept',
+    });
     expect(decideCall(large, { keepCall: 0.45, keepResult: 0.1 }, { ...defaults, keepCallThreshold: 0.4 }).action).toBe(
       'drop_result',
     );
@@ -309,12 +394,9 @@ describe('applying decisions', () => {
       '[fast-jev-compaction dropped the 1000-char result of this call; re-run the tool if needed]',
     );
     expect(kept[2]?.toolResults?.[0]?.text).toBe(kept[1]?.toolUses[0]?.text);
-    expect(kept[4]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
-    );
-    expect(kept[5]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
-    );
+    const cut = new RegExp(`^x{200}\\n\\[…\\]\\nx{100}\\n\\[fast-jev-compaction truncated 1700 chars of this tool result; re-run the tool if needed\\]$`);
+    expect(kept[4]?.toolUses[0]?.text).toMatch(cut);
+    expect(kept[5]?.toolResults?.[0]?.text).toMatch(cut);
     expect(kept[6]).toBe(messages[6]);
     expect(kept[7]?.toolResults?.[0]?.text).toContain('expected 2 to be 3');
 
@@ -385,9 +467,11 @@ describe('applying decisions', () => {
     const total = original.length;
 
     const { messages: kept } = applyDecisions(messages, decisions, calls, { ...options, truncateHeadChars: 50 });
+    expect(headTail(50)).toEqual({ head: 34, tail: 16 });
     expect(kept[2]?.toolResults?.[0]?.text).toBe(
-      `${original.slice(0, 50)}\n[fast-jev-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
+      `${original.slice(0, 34)}\n[…]\n${original.slice(-16)}\n[fast-jev-compaction truncated ${total - 50} chars of this tool result; re-run the tool if needed]`,
     );
+    expect(isTombstone(kept[2]!.toolResults![0]!.text)).toBe(true);
     expect(kept[1]?.toolUses[0]?.text).toBe(kept[2]?.toolResults?.[0]?.text);
 
     const { messages: noHead } = applyDecisions(messages, decisions, calls, { ...options, truncateHeadChars: 0 });
@@ -464,15 +548,102 @@ describe('compact', () => {
     const output = await compact(transcript(), fakeJev(() => 0.95), { preserveRecentMessages: 1 });
     expect(output.decisions.map((d) => d.action)).toEqual(['keep', 'keep', 'drop_result']);
     expect(reductionRatio(output)).toBe(0);
+    expect(output.decisions.map((d) => [d.resultAsked, d.resultChars, d.about])).toEqual([
+      [true, fileA.length, 'src/a.ts'],
+      [true, fileB.length, 'src/b.ts'],
+      [false, 34, 'npm test'],
+    ]);
   });
 
-  it('rejects malformed answers', async () => {
-    const broken: JevAsker = {
-      ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
+  it('reads the judge reply whether it is a string, a message or content blocks', () => {
+    const questions = { call_t1: { instruction: 'q', values: ['yes', 'no'] } };
+    const body = '{"call_t1": 0.9}';
+    for (const reply of [
+      body,
+      { text: body },
+      { content: [{ type: 'text', text: body }] },
+      { message: { content: [{ type: 'text', text: 'note ' }, { type: 'text', text: body }] } },
+      [{ type: 'text', text: body }],
+    ]) {
+      expect(parseClaudeReply(reply, questions).answers.call_t1?.noul).toBeCloseTo(0.9);
+    }
+    expect(replyText(null)).toBe('');
+    expect(() => parseClaudeReply({ usage: {} }, questions)).toThrow(/no JSON object/);
+  });
+
+  it('leaves a call the judge did not answer unscored, and rejects a reply that answers nothing', async () => {
+    const partial: JevAsker = {
+      ask: async () => ({ answers: { call_t1: { noul: 0.1 }, result_t1: { noul: 0.1 }, call_t2: { noul: 0.1 } } }),
     };
-    await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
-      /Invalid Jev answer/,
+    const output = await compact(transcript(), partial, { preserveRecentMessages: 1 });
+    // t2's result question went unanswered, t3 was not answered at all: both stay as they are.
+    expect(output.decisions.map((d) => d.reason)).toEqual(['call_stubbed', 'unscored', 'unscored']);
+    expect(output.messages[4]).toBe(output.messages[4]);
+    const nothing: JevAsker = { ask: async () => ({ answers: { call_t1: { noul: Number.NaN } } }) };
+    await expect(compact(transcript(), nothing, { preserveRecentMessages: 1 })).rejects.toThrow(
+      /Invalid Jev answers: none of/,
     );
+  });
+
+  it('puts the borderline calls to the arbiter and takes its answer, remembering what the judge said', async () => {
+    const asked: string[][] = [];
+    const arbiter: JevAsker = {
+      async ask(_state, questions) {
+        asked.push(Object.keys(questions));
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: key.startsWith('call_') ? 0.9 : 0.1 }]),
+          ),
+        };
+      },
+    };
+    // t1 sits on the fence (0.45), t2 is a clear stub (0.05), t3 is pinned.
+    const judge = fakeJev((name) => (name === 'call_t1' ? 0.45 : name === 'call_t2' ? 0.05 : 0.1));
+    const output = await compact(transcript(), judge, { preserveRecentMessages: 1, arbiter });
+    expect(asked).toEqual([['call_t1', 'result_t1']]);
+    expect(output.decisions[0]).toMatchObject({
+      id: 't1',
+      action: 'drop_result',
+      keepCall: 0.9,
+      keepResult: 0.1,
+      judged: { keepCall: 0.45, keepResult: 0.1 },
+    });
+    expect(output.decisions[1]).toMatchObject({ id: 't2', action: 'stub_call', keepCall: 0.05 });
+    expect(output.decisions[1]?.judged).toBeUndefined();
+    expect(output.stats).toMatchObject({ arbitrated: 1, arbiterFlips: 1 });
+
+    const silent = await compact(transcript(), judge, { preserveRecentMessages: 1, arbiter, arbitrateBand: 0 });
+    expect(silent.stats).toMatchObject({ arbitrated: 0, arbiterFlips: 0 });
+    expect(silent.decisions[0]?.action).toBe('stub_call');
+
+    expect(isBorderline({ resultChars: 20, tombstone: false }, { keepCall: 0.64, keepResult: 0 }, defaults)).toBe(true);
+    expect(isBorderline({ resultChars: 20, tombstone: false }, { keepCall: 0.66, keepResult: 0 }, defaults)).toBe(false);
+    expect(isBorderline({ resultChars: 2000, tombstone: false }, { keepCall: 0.9, keepResult: 0.4 }, defaults)).toBe(true);
+  });
+
+  it('stops sending requests once one has failed', async () => {
+    let sent = 0;
+    const failing: JevAsker = {
+      ask: async (_state, questions) => {
+        sent += 1;
+        const first = sent === 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        if (first) throw new Error('Jev request failed (400): bad');
+        return {
+          answers: Object.fromEntries(Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.1 }])),
+        };
+      },
+    };
+    await expect(
+      compact(manyCalls(40, 'r'.repeat(2000)), failing, {
+        preserveRecentMessages: 1,
+        maxStateTokens: 1500,
+        maxRequestTokens: 2000,
+        concurrency: 2,
+      }),
+    ).rejects.toThrow(/400/);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(sent).toBe(2);
   });
 
   it('measures how much of a history is prunable without a request', () => {
@@ -499,7 +670,48 @@ describe('retry', () => {
       }),
     ).rejects.toThrow(/400/);
     expect(isRetryable(new Error('fetch failed'))).toBe(true);
-    expect(isRetryable(new Error('Invalid Jev answer for x'))).toBe(false);
+    expect(isRetryable(new Error('judge request timed out after 5 ms'))).toBe(true);
+    expect(isRetryable(new Error('Invalid Jev answers: none of 3 questions answered'))).toBe(false);
+  });
+
+  it('waits as long as a Retry-After asks, and gives up when that is too long', async () => {
+    expect(retryAfterMs(undefined)).toBeUndefined();
+    expect(retryAfterMs({ 'Retry-After': '3' })).toBe(3000);
+    expect(retryAfterMs({ 'retry-after': ' 12 ' })).toBe(12_000);
+    const now = Date.parse('2026-09-24T16:00:00Z');
+    expect(retryAfterMs({ 'retry-after': 'Thu, 24 Sep 2026 16:00:05 GMT' }, now)).toBe(5000);
+    expect(retryAfterMs({ 'retry-after': 'soon' })).toBeUndefined();
+
+    const slept: number[] = [];
+    let attempts = 0;
+    const paced = async (): Promise<string> => {
+      attempts += 1;
+      if (attempts === 1) throw new JevRequestError(429, 'slow down', 4000);
+      return 'ok';
+    };
+    await expect(withRetry(paced, { sleep: async (ms) => void slept.push(ms) })).resolves.toBe('ok');
+    expect(slept).toEqual([4000]);
+
+    let tries = 0;
+    await expect(
+      withRetry(
+        async () => {
+          tries += 1;
+          throw new JevRequestError(429, 'come back later', 120_000);
+        },
+        { sleep: async () => undefined },
+      ),
+    ).rejects.toThrow(/429/);
+    expect(tries).toBe(1);
+  });
+
+  it('gives up on a request that outlives its timeout', async () => {
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    const slow = new Promise<string>((resolve) => setTimeout(() => resolve('late'), 50));
+    await expect(withTimeout(slow, 5, sleep, 'judge request')).rejects.toThrow(/judge request timed out after 5 ms/);
+    await expect(withTimeout(Promise.resolve('fast'), 50, sleep)).resolves.toBe('fast');
+    await expect(withTimeout(slow, 0, sleep)).resolves.toBe('late');
+    await expect(withTimeout(Promise.resolve('no timer'), 5, undefined)).resolves.toBe('no timer');
   });
 });
 
@@ -519,6 +731,16 @@ describe('HTTP client', () => {
 
   it('rejects failed and malformed responses', () => {
     expect(() => parseJevResponse(500, false, 'boom')).toThrow(/500/);
+    const limited = (() => {
+      try {
+        parseJevResponse(429, false, 'busy', { 'Retry-After': '2' });
+      } catch (error) {
+        return error;
+      }
+      return undefined;
+    })();
+    expect(limited).toBeInstanceOf(JevRequestError);
+    expect((limited as JevRequestError).retryAfterMs).toBe(2000);
     expect(() => parseJevResponse(200, true, 'not json')).toThrow(/malformed/);
     expect(() => parseJevResponse(200, true, '{}')).toThrow(/missing answers/);
     expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });

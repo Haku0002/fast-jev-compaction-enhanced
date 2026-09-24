@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   compactSession,
+  decisionLines,
   decisionLog,
   decisionLogLines,
+  probabilityProfile,
   libraryOptions,
+  pickArbiter,
   resolveHookConfig,
   selectBackend,
   shouldCompact,
@@ -61,6 +64,8 @@ const DEFAULT_CONFIG = {
   backend: 'auto',
   claudeModel: 'haiku',
   nothingToPrune: 'keep',
+  timeoutMs: 90_000,
+  arbiterModel: 'haiku',
 };
 
 describe('hook config', () => {
@@ -101,6 +106,10 @@ describe('hook config', () => {
       backend: 'auto',
       nothingToPrune: 'keep',
     });
+    expect(resolveHookConfig({ backend: 'fork' }).backend).toBe('fork');
+    expect(resolveHookConfig({ arbiterModel: ' sonnet ' }).arbiterModel).toBe('sonnet');
+    expect(resolveHookConfig({ arbiterModel: '' }).arbiterModel).toBe('');
+    expect(resolveHookConfig({ arbitrateBand: 0.2 }).arbitrateBand).toBe(0.2);
     expect('dropCalls' in resolveHookConfig({ dropCalls: 'bogus' })).toBe(false);
   });
 
@@ -161,10 +170,16 @@ describe('compactSession', () => {
     expect(output.decisions.map((d) => d.action)).toEqual(['stub_call', 'drop_result']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
     expect(messages[1]?.toolUses[0]?.text).toMatch(/^\[fast-jev-compaction dropped the 1000-char result/);
+    // t2's result is too short to cut: kept, with its input bounded.
     expect(summarize(output)).toMatch(
-      /^\d+% reduction; 1 results truncated, 1 stubbed; 1 request\(s\), largest state ~\d+ tokens, \d+ ms$/,
+      /^\d+% reduction; 1 kept, 1 stubbed; 1 request\(s\), largest state ~\d+ tokens, \d+ ms; call p: 0 <0.1, 1 <0.3, 0 <0.5, 1 ≥0.5 \| result p \(1 asked\): 0 <0.1, 1 <0.3, 0 <0.5, 0 ≥0.5$/,
     );
     expect(decisionLog(output)).toBe('t1:Read:stub_call/call=0.10/result=0.10 t2:Bash:drop_result/call=0.90/result=0.00');
+    expect(decisionLines(output)).toEqual([
+      '  t1 Read stub_call call=0.10 result=0.10 1000ch src/a.ts',
+      '  t2 Bash drop_result call=0.90 result=- 34ch npm test',
+    ]);
+    expect(probabilityProfile({ ...output, decisions: [] })).toBe('');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
 
@@ -189,7 +204,8 @@ describe('compactSession', () => {
   it('retries a transient Jev failure once', async () => {
     let attempts = 0;
     const slept: number[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    // The recording sleeper resolves at once, so the timeout is off for this test.
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, timeoutMs: 0 }), apiKey: 'k' };
     const flaky = jevFetch(() => 0.1);
     const { result: output } = await compactSession(transcript(), config, {
       fetch: async (url, init) => {
@@ -202,6 +218,61 @@ describe('compactSession', () => {
     expect(attempts).toBe(2);
     expect(slept).toEqual([1500]);
     expect(output.stats.requests).toBe(1);
+  });
+
+  it('sends the calls Jev was unsure about to the arbiter model, and only with the Jev judge', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, arbiterModel: 'sonnet' }), apiKey: 'k' };
+    const prompts: { model: string; prompt: string }[] = [];
+    const complete = async (request: { model: string; prompt: string }) => {
+      prompts.push(request);
+      return '{"call_t1": 0.9, "result_t1": 0.2}';
+    };
+    const { result: output } = await compactSession(transcript(), config, {
+      fetch: jevFetch((name) => (name === 'call_t1' ? 0.4 : 0.05)),
+      complete,
+    });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]?.model).toBe('sonnet');
+    expect(prompts[0]?.prompt).toContain('- call_t1:');
+    expect(prompts[0]?.prompt).not.toContain('- call_t2:');
+    expect(output.decisions.map((d) => d.action)).toEqual(['drop_result', 'stub_call']);
+    expect(output.stats).toMatchObject({ arbitrated: 1, arbiterFlips: 1 });
+    expect(summarize(output)).toContain('arbiter: 1 re-judged, 1 flipped');
+    expect(decisionLines(output)[0]).toBe('  t1 Read drop_result call=0.90(jev 0.40) result=0.20(jev 0.05) 1000ch src/a.ts');
+
+    expect(pickArbiter({ ...config, arbiterModel: '' }, { fetch: jevFetch(() => 0), complete })).toBeUndefined();
+    expect(pickArbiter({ ...config, backend: 'claude' }, { fetch: jevFetch(() => 0), complete })).toBeUndefined();
+    expect(pickArbiter(config, { fetch: jevFetch(() => 0) })).toBeUndefined();
+  });
+
+  it('paces a retry by Retry-After and gives up on one too long to wait for', async () => {
+    const slept: number[] = [];
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, timeoutMs: 0 }), apiKey: 'k' };
+    const good = jevFetch(() => 0.1);
+    let attempts = 0;
+    const { result: output } = await compactSession(transcript(), config, {
+      fetch: async (url, init) => {
+        attempts += 1;
+        if (attempts === 1) return { status: 429, ok: false, text: 'busy', headers: { 'retry-after': '3' } };
+        return good(url, init);
+      },
+      sleep: async (ms) => void slept.push(ms),
+    });
+    expect(attempts).toBe(2);
+    expect(slept).toEqual([3000]);
+    expect(output.stats.requests).toBe(1);
+
+    let tries = 0;
+    await expect(
+      compactSession(transcript(), config, {
+        fetch: async () => {
+          tries += 1;
+          return { status: 429, ok: false, text: 'busy', headers: { 'retry-after': '600' } };
+        },
+        sleep: async () => undefined,
+      }),
+    ).rejects.toThrow(/429/);
+    expect(tries).toBe(1);
   });
 
   it('scores through the Claude judge when no key is set, asking only the questions that matter', async () => {
@@ -224,18 +295,58 @@ describe('compactSession', () => {
     expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
   });
 
-  it('throws when the Claude judge answers badly so the hook falls back', async () => {
+  it('throws when the Claude judge answers badly so the hook falls back, but tolerates a partial answer', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
     const fetch = jevFetch(() => 0);
     await expect(compactSession(transcript(), config, { fetch, complete: async () => 'nope' })).rejects.toThrow(/no JSON/);
     await expect(
-      compactSession(transcript(), config, { fetch, complete: async () => '{"call_t1": 0.1}' }),
-    ).rejects.toThrow(/no probability for/);
+      compactSession(transcript(), config, { fetch, complete: async () => '{"other": 0.1}' }),
+    ).rejects.toThrow(/answered none/);
+    const { result: partial } = await compactSession(transcript(), config, {
+      fetch,
+      complete: async () => '{"call_t1": 0.1, "result_t1": 0.1}',
+    });
+    expect(partial.decisions.map((d) => d.reason)).toEqual(['call_stubbed', 'unscored']);
     await expect(compactSession(transcript(), config, { fetch })).rejects.toThrow(/model\.complete/);
   });
 
+  it('scores through a fork of the session when backend is fork: no state, a legend of tool_use_ids', async () => {
+    const config = resolveHookConfig({ preserveRecentMessages: 1, backend: 'fork' });
+    expect(selectBackend(config)).toBe('fork');
+    expect(libraryOptions(config).maxStateTokens).toBeGreaterThan(1_000_000);
+    const prompts: string[] = [];
+    const fork = async (request: { prompt: string }) => {
+      prompts.push(request.prompt);
+      return { text: '{"call_t1": 0.1, "result_t1": 0.1, "call_t2": 0.9}' };
+    };
+    const { result: output, messages } = await compactSession(transcript(), config, { fetch: jevFetch(() => 0), fork });
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('- t1 = Read tool-1 (1000 chars)');
+    expect(prompts[0]).toContain('- t2 = Bash tool-2 (34 chars, error)');
+    expect(prompts[0]).toContain('CURRENT GOAL:');
+    expect(prompts[0]).not.toContain('"history"');
+    expect(prompts[0]).not.toContain(fileA.slice(0, 40));
+    expect(output.decisions.map((d) => d.action)).toEqual(['stub_call', 'drop_result']);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+    await expect(
+      compactSession(transcript(), config, { fetch: jevFetch(() => 0), fork: async () => null }),
+    ).rejects.toThrow(/fork unavailable/);
+    await expect(compactSession(transcript(), config, { fetch: jevFetch(() => 0) })).rejects.toThrow(/model\.fork/);
+  });
+
+  it('gives up on a judge request that outlives timeoutMs', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, timeoutMs: 10 }), apiKey: 'k' };
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    const hung = () => new Promise<{ status: number; ok: boolean; text: string }>(() => undefined);
+    await expect(compactSession(transcript(), config, { fetch: hung, sleep })).rejects.toThrow(
+      /judge request timed out after 10 ms/,
+    );
+    const quick = resolveHookConfig({ timeoutMs: -5 });
+    expect(quick.timeoutMs).toBe(0);
+  });
+
   it('throws on a missing key and on failed requests so the hook falls back', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), backend: 'jev' as const };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, timeoutMs: 0 }), backend: 'jev' as const };
     await expect(compactSession(transcript(), config, { fetch: jevFetch(() => 0) })).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
       compactSession(

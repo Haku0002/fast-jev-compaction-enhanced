@@ -8,10 +8,11 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-import { claudeAsker, DEFAULT_CLAUDE_MODEL, type Completer } from '../src/claude-asker.js';
+import { claudeAsker, DEFAULT_CLAUDE_MODEL, forkAsker, type Completer, type Forker } from '../src/claude-asker.js';
 import { compact, prunableShare, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, withRetry } from '../src/request.js';
+import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, withRetry, withTimeout } from '../src/request.js';
 import type {
+  CallDecision,
   CompactOptions,
   CompactResult,
   DropCalls,
@@ -21,7 +22,13 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
-export type Backend = 'auto' | 'jev' | 'claude';
+/**
+ * `jev` scores over HTTP; `claude` over `$.model.complete` with windowed
+ * states; `fork` over `$.model.fork`, the session's own transcript from its
+ * prompt cache, so the judge sees the whole conversation at no input cost;
+ * `auto` picks `jev` when a key is set, else `claude`.
+ */
+export type Backend = 'auto' | 'jev' | 'claude' | 'fork';
 export type NothingToPrune = 'keep' | 'summary';
 
 const HOOK_DEFAULTS = {
@@ -31,14 +38,21 @@ const HOOK_DEFAULTS = {
   backend: 'auto' as Backend,
   claudeModel: DEFAULT_CLAUDE_MODEL,
   nothingToPrune: 'keep' as NothingToPrune,
+  timeoutMs: 90_000,
+  arbiterModel: 'haiku',
 };
 
 /** The Claude judge reads far more than Jev; its windows default to this size. */
 const CLAUDE_STATE_TOKENS = 80_000;
 const CLAUDE_REQUEST_TOKENS = 100_000;
+/** The fork judge has the transcript already; the state is only planned, never sent, so one window takes everything. */
+const FORK_STATE_TOKENS = 4_000_000;
+const FORK_REQUEST_TOKENS = 4_000_000;
 /** Percentage points the context must fall, or grow past the last trigger, before turn.complete compacts again. */
 const REARM_PERCENT = 10;
 const LOG_LINES = 200;
+/** Lines kept of the per-call decisions log, about 30 compactions of a long session. */
+const DECISION_LOG_LINES = 3000;
 
 export type HookFetchInit = {
   method?: string;
@@ -50,6 +64,8 @@ export type HookFetchResponse = {
   status: number;
   ok: boolean;
   text: string;
+  /** Response headers, when the transport has them; `Retry-After` paces a retry. */
+  headers?: Record<string, string>;
 };
 
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
@@ -60,12 +76,20 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
-  /** Which judge scores the calls: Jev over HTTP, Claude over `$.model.complete`, or Jev when a key is set. */
+  /** Which judge scores the calls: Jev over HTTP, Claude over `$.model.complete` or `$.model.fork`, or Jev when a key is set. */
   backend: Backend;
   /** Model alias or id for the Claude judge. */
   claudeModel: string;
   /** When too little is prunable: leave the history as it is, or hand it to the built-in summary. */
   nothingToPrune: NothingToPrune;
+  /** Milliseconds one judge request may take before the round is given up; 0 waits forever. */
+  timeoutMs: number;
+  /**
+   * Model alias or id that re-judges the calls Jev was unsure about (within
+   * `arbitrateBand` of a threshold) over `$.model.complete`; empty turns the
+   * arbiter off. Only with the Jev judge: the Claude judges are their own.
+   */
+  arbiterModel: string;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -79,7 +103,7 @@ function optionString(options: PluginOptions, key: string): string | undefined {
 }
 
 function resolveBackend(value: string | undefined): Backend {
-  return value === 'jev' || value === 'claude' ? value : HOOK_DEFAULTS.backend;
+  return value === 'jev' || value === 'claude' || value === 'fork' ? value : HOOK_DEFAULTS.backend;
 }
 
 function resolveDropCalls(value: string | undefined): DropCalls | undefined {
@@ -98,6 +122,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'truncateHeadChars',
     'stubChars',
     'concurrency',
+    'arbitrateBand',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -115,6 +140,9 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     claudeModel: optionString(options, 'claudeModel') ?? HOOK_DEFAULTS.claudeModel,
     nothingToPrune:
       optionString(options, 'nothingToPrune') === 'summary' ? 'summary' : HOOK_DEFAULTS.nothingToPrune,
+    timeoutMs: Math.max(0, optionNumber(options, 'timeoutMs', HOOK_DEFAULTS.timeoutMs)),
+    arbiterModel:
+      typeof options['arbiterModel'] === 'string' ? options['arbiterModel'].trim() : HOOK_DEFAULTS.arbiterModel,
   };
   const dropCalls = resolveDropCalls(optionString(options, 'dropCalls'));
   if (dropCalls) config.dropCalls = dropCalls;
@@ -145,11 +173,20 @@ export function jevAsker(
             headers: request.headers,
             body: request.body,
           });
-          return parseJevResponse(response.status, response.ok, response.text);
+          return parseJevResponse(response.status, response.ok, response.text, response.headers);
         },
         { sleep },
       );
     },
+  };
+}
+
+/** The same asker with every `ask` bounded to `ms`; a timed-out request fails the round like any other error. */
+export function timedAsker(asker: JevAsker, ms: number, sleep: ((ms: number) => Promise<void>) | undefined): JevAsker {
+  if (!sleep || ms <= 0) return asker;
+  return {
+    ask: (state, questions, calls) =>
+      withTimeout(asker.ask(state, questions, calls), ms, sleep, 'judge request'),
   };
 }
 
@@ -212,36 +249,52 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** The judge the config and the available key select: `jev` or `claude`. */
+/** The judge the config and the available key select: `jev`, `claude` or `fork`. */
 export function selectBackend(config: HookConfig): Exclude<Backend, 'auto'> {
   if (config.backend === 'auto') return config.apiKey ? 'jev' : 'claude';
   return config.backend;
 }
 
-/** The library options for the selected judge: the Claude judge gets wider windows unless set. */
+/** The library options for the selected judge: the Claude judges get wider windows unless set. */
 export function libraryOptions(config: HookConfig): CompactOptions {
-  if (selectBackend(config) !== 'claude') return config;
+  const backend = selectBackend(config);
+  if (backend === 'jev') return config;
+  const wide = backend === 'fork' ? [FORK_STATE_TOKENS, FORK_REQUEST_TOKENS] : [CLAUDE_STATE_TOKENS, CLAUDE_REQUEST_TOKENS];
   return {
     ...config,
-    maxStateTokens: config.maxStateTokens ?? CLAUDE_STATE_TOKENS,
-    maxRequestTokens: config.maxRequestTokens ?? CLAUDE_REQUEST_TOKENS,
+    maxStateTokens: config.maxStateTokens ?? wide[0],
+    maxRequestTokens: config.maxRequestTokens ?? wide[1],
   };
 }
 
 export type Judges = {
   fetch: HookFetch;
   complete?: Completer;
+  fork?: Forker;
   sleep?: (ms: number) => Promise<void>;
 };
 
 /** Builds the asker for the selected judge; throws when Jev is selected without a key. */
 export function pickAsker(config: HookConfig, judges: Judges): JevAsker {
-  if (selectBackend(config) === 'claude') {
+  const backend = selectBackend(config);
+  let asker: JevAsker;
+  if (backend === 'fork') {
+    if (!judges.fork) throw new Error('fork judge needs $.model.fork');
+    asker = forkAsker(judges.fork);
+  } else if (backend === 'claude') {
     if (!judges.complete) throw new Error('Claude judge needs $.model.complete');
-    return claudeAsker(judges.complete, { model: config.claudeModel });
+    asker = claudeAsker(judges.complete, { model: config.claudeModel });
+  } else {
+    if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+    asker = jevAsker(judges.fetch, config.apiKey, config.model, judges.sleep);
   }
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  return jevAsker(judges.fetch, config.apiKey, config.model, judges.sleep);
+  return timedAsker(asker, config.timeoutMs, judges.sleep);
+}
+
+/** The arbiter for the borderline calls, when Jev judges and a model is named; none otherwise. */
+export function pickArbiter(config: HookConfig, judges: Judges): JevAsker | undefined {
+  if (selectBackend(config) !== 'jev' || !config.arbiterModel || !judges.complete) return undefined;
+  return timedAsker(claudeAsker(judges.complete, { model: config.arbiterModel }), config.timeoutMs, judges.sleep);
 }
 
 /** Runs the library over a session transcript; throws when the judge is unavailable or fails. */
@@ -250,7 +303,9 @@ export async function compactSession(
   config: HookConfig,
   judges: Judges,
 ): Promise<SessionCompaction> {
-  const result = await compact(messages, pickAsker(config, judges), libraryOptions(config));
+  const arbiter = pickArbiter(config, judges);
+  const options: CompactOptions = arbiter ? { ...libraryOptions(config), arbiter } : libraryOptions(config);
+  const result = await compact(messages, pickAsker(config, judges), options);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -258,8 +313,47 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+/** The scored (not pinned, not unscored) decisions of a round. */
+function scored(result: CompactResult): CallDecision[] {
+  return result.decisions.filter((d) => d.reason !== 'pinned' && d.reason !== 'unscored');
+}
+
+const BANDS: readonly [label: string, below: number][] = [
+  ['<0.1', 0.1],
+  ['<0.3', 0.3],
+  ['<0.5', 0.5],
+  ['≥0.5', Number.POSITIVE_INFINITY],
+];
+
+function bands(values: readonly number[]): string {
+  const counts = BANDS.map(() => 0);
+  for (const value of values) {
+    const index = BANDS.findIndex(([, below]) => value < below);
+    const band = index < 0 ? BANDS.length - 1 : index;
+    counts[band] = (counts[band] ?? 0) + 1;
+  }
+  return BANDS.map(([label], i) => `${counts[i]} ${label}`).join(', ');
+}
+
+/**
+ * How the judge's probabilities fell, in four bands each for the call and
+ * the result question: the quickest check that a threshold is placed where
+ * the answers actually split, or that a round stubbed nearly everything
+ * because the judge sat just under 0.5 rather than near zero.
+ */
+export function probabilityProfile(result: CompactResult): string {
+  const decisions = scored(result);
+  if (decisions.length === 0) return '';
+  const asked = decisions.filter((d) => d.resultAsked);
+  const call = `call p: ${bands(decisions.map((d) => d.keepCall))}`;
+  const arbitrated = result.stats.arbitrated > 0 ? ` | arbiter: ${result.stats.arbitrated} re-judged, ${result.stats.arbiterFlips} flipped` : '';
+  if (asked.length === 0) return `${call}${arbitrated}`;
+  return `${call} | result p (${asked.length} asked): ${bands(asked.map((d) => d.keepResult))}${arbitrated}`;
+}
+
 export function summarize(result: CompactResult): string {
   const { stats } = result;
+  const profile = probabilityProfile(result);
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
@@ -271,7 +365,9 @@ export function summarize(result: CompactResult): string {
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; ${stats.requests} request(s), largest state ~${stats.stateTokens} tokens, ${stats.ms} ms`;
+  }; ${stats.requests} request(s), largest state ~${stats.stateTokens} tokens, ${stats.ms} ms${
+    profile ? `; ${profile}` : ''
+  }`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -284,6 +380,24 @@ export function decisionLog(result: CompactResult): string {
         `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
     )
     .join(' ');
+}
+
+/**
+ * One line per decision for the decisions log file, with what the call was
+ * about and how big its result was, so a stubbed Edit or a kept Read can be
+ * told apart after the fact.
+ */
+export function decisionLines(result: CompactResult): string[] {
+  return result.decisions
+    .filter((d) => d.reason !== 'pinned')
+    .map((d) => {
+      const was = (value: number, judged: number | undefined): string =>
+        judged === undefined ? value.toFixed(2) : `${value.toFixed(2)}(jev ${judged.toFixed(2)})`;
+      const call = was(d.keepCall, d.judged?.keepCall);
+      const res = d.resultAsked ? was(d.keepResult, d.judged?.keepResult) : '-';
+      const size = d.resultChars === undefined ? '' : ` ${d.resultChars}ch`;
+      return `  ${d.id} ${d.tool} ${d.action} call=${call} result=${res}${size} ${d.about ?? ''}`.trimEnd();
+    });
 }
 
 export function decisionLogLines(
@@ -361,18 +475,47 @@ type Recorder = Env & {
   store: { set: (key: string, value: unknown) => Promise<void> };
 };
 
+async function homeDir($: Env): Promise<string | undefined> {
+  return (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'));
+}
+
+/** Appends `lines` to `path`, keeping the last `keep` lines; never throws. */
+async function appendBounded($: Recorder, path: string, lines: readonly string[], keep: number): Promise<void> {
+  try {
+    const previous = (await $.fs.exists(path)) ? await $.fs.read(path) : '';
+    const kept = previous.split('\n').filter(Boolean);
+    kept.push(...lines);
+    await $.fs.write(path, `${kept.slice(-keep).join('\n')}\n`);
+  } catch {
+    // a log line is never worth failing a compaction
+  }
+}
+
 /** Appends one line to `~/.claude/fast-jev-compaction.log` and keeps the last outcome in the store; never throws. */
 async function record($: Recorder, line: string): Promise<void> {
   try {
     const stamp = new Date(await $.clock.now()).toISOString();
     await $.store.set('lastCompaction', { at: stamp, line });
-    const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'));
+    const home = await homeDir($);
     if (!home) return;
-    const path = `${home}/.claude/fast-jev-compaction.log`;
-    const previous = (await $.fs.exists(path)) ? await $.fs.read(path) : '';
-    const lines = previous.split('\n').filter(Boolean).slice(-(LOG_LINES - 1));
-    lines.push(`${stamp} ${line}`);
-    await $.fs.write(path, `${lines.join('\n')}\n`);
+    await appendBounded($, `${home}/.claude/fast-jev-compaction.log`, [`${stamp} ${line}`], LOG_LINES);
+  } catch {
+    // a log line is never worth failing a compaction
+  }
+}
+
+/**
+ * Appends a round's per-call decisions to `~/.claude/fast-jev-compaction.decisions.log`
+ * under a header naming the round, so thresholds can be checked against what
+ * the judge actually answered; never throws.
+ */
+async function recordDecisions($: Recorder, header: string, result: CompactResult): Promise<void> {
+  try {
+    const stamp = new Date(await $.clock.now()).toISOString();
+    const home = await homeDir($);
+    if (!home) return;
+    const lines = [`${stamp} ${header}`, ...decisionLines(result)];
+    await appendBounded($, `${home}/.claude/fast-jev-compaction.decisions.log`, lines, DECISION_LOG_LINES);
   } catch {
     // a log line is never worth failing a compaction
   }
@@ -409,9 +552,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { result, messages } = await compactSession(event.messages, config, {
         fetch: async (url, init) => {
           const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text };
+          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         complete: (request) => $.model.complete(request),
+        // The fork judge is only for the main conversation: a subagent's transcript is not the session's.
+        fork: event.agentId === undefined ? (request) => $.model.fork(request) : undefined,
         sleep: (ms) => $.clock.sleep(ms),
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
@@ -420,6 +565,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       )})`;
       notify($, line, quiet);
       await record($, line);
+      await recordDecisions($, line, result);
       return { messages };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);

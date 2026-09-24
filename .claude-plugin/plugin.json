@@ -1,14 +1,32 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself (no extra key).",
   "license": "MIT",
   "userConfig": {
     "backend": {
       "type": "string",
       "title": "Judge backend",
-      "description": "Who scores the tool calls: 'claude' uses the session's own API client via $.model.complete (no key needed); 'jev' uses TypeSafe Jev over HTTP; 'auto' picks jev when a TypeSafe key is set, else claude.",
+      "description": "Who scores the tool calls: 'claude' uses the session's own API client via $.model.complete (no key needed); 'fork' uses $.model.fork, a completion over the session's own cached transcript, so the judge sees the whole conversation at almost no input cost (experimental; falls back to the built-in summary when the fork is unavailable); 'jev' uses TypeSafe Jev over HTTP; 'auto' picks jev when a TypeSafe key is set, else claude.",
       "default": "auto"
+    },
+    "arbiterModel": {
+      "type": "string",
+      "title": "Arbiter model",
+      "description": "Model alias or id (haiku, sonnet, ...) that re-judges, through the session's own API client, the calls Jev was unsure about: those within arbitrateBand of a threshold. Its answer replaces Jev's; the decisions log shows both. Empty turns the arbiter off. Only with the Jev judge.",
+      "default": "haiku"
+    },
+    "arbitrateBand": {
+      "type": "number",
+      "title": "Arbitration band",
+      "description": "Half-width of the band around keepThreshold and keepCallThreshold whose calls go to the arbiter; 0.15 sends a call with keepCall between 0.35 and 0.65.",
+      "default": 0.15
+    },
+    "timeoutMs": {
+      "type": "number",
+      "title": "Judge request timeout",
+      "description": "Milliseconds one judge request may take before the round is given up and the built-in summary runs; 0 waits forever.",
+      "default": 90000
     },
     "claudeModel": {
       "type": "string",

@@ -26,8 +26,10 @@ built-in compaction summary with the original messages.
 2. The candidates are walked oldest first and cut into **windows** of
    consecutive messages. Each window goes to the judge in one request whose
    **state** shows the window in full: every call with its input (up to 300
-   characters) and the head of its output (160 characters), texts abridged to
-   head + tail, host blocks (system reminders, task notifications) elided.
+   characters), the head and the tail of its output (120 + 100 characters, so
+   a command's verdict at the end is visible), a `superseded_by` hint naming
+   the next later call on the same file, command or search, texts abridged
+   to head + tail, host blocks (system reminders, task notifications) elided.
    The first message and the newest `preserveRecentMessages` messages frame
    every window, and a `note` entry stands for each range the request leaves
    out. A window closes when its state would pass `maxStateTokens` (25k by
@@ -46,14 +48,26 @@ built-in compaction summary with the original messages.
    a note left by an earlier round, a second question asks whether its
    **output** holds information the assistant would need again (an error, a
    value, contents being edited) beyond what re-running the tool would give.
+   Each question spells its criterion out even though the state's `context`
+   states it too: a one-line phrasing was tried and, measured on a real
+   session (`npm run calibrate`), sat 0.3 lower across the board and flipped
+   two thirds of the decisions, so the longer wording stays.
+   Optionally an **arbiter** (`arbiter`, any `JevAsker`) re-judges the calls
+   whose answer landed within `arbitrateBand` (0.15) of a threshold, over the
+   same window, and its answer replaces the judge's; the decision keeps the
+   judge's answer as `judged` so the two can be compared.
 5. Requests run with `concurrency` in flight; a rate limit or server error is
-   retried once. Answers are merged.
+   retried once (after the `Retry-After` the server asks for, when it gives
+   one under 30 s; a longer wait fails the round instead), and once one
+   request has failed the others stop. Answers are merged. A call the judge left unanswered stays untouched
+   (`unscored`); only a reply that answers nothing fails the round.
 6. Decisions per call:
    - `keepResult >= keepThreshold` -> keep call and result verbatim;
    - else `keepCall >= keepCallThreshold` -> keep the call, cut the result to
-     its first `truncateHeadChars` characters plus a note, and cut every
-     oversized input field (a Write's content, an Edit's strings) the same
-     way;
+     `truncateHeadChars` characters (two thirds head, one third tail) plus a
+     note, and cut every oversized input field (a Write's content, an Edit's
+     strings) to a head the same way; a result too short to cut counts as
+     `kept`;
    - else -> `dropCalls: 'stub'` (default) keeps the tool name, the input cut
      to `stubChars` characters and a one-line note in place of the result,
      so the history keeps a call before every report the assistant wrote;
@@ -67,8 +81,8 @@ built-in compaction summary with the original messages.
    removed, untouched messages are returned as the same objects, and no result
    is ever left without its call.
 
-Jev failures, malformed answers and a missing key throw; the caller (or the
-Claude Code hook) decides what to fall back to. `prunableShare(messages)`
+Jev failures, replies that answer nothing and a missing key throw; the caller
+(or the Claude Code hook) decides what to fall back to. `prunableShare(messages)`
 tells, without a request, how much of a history is tool traffic and host
 blocks at all.
 
@@ -126,15 +140,20 @@ put it in a source file.
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `25000` | Estimated token ceiling for one request's state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for one request's state plus questions |
-| `truncateHeadChars` | `300` | Characters kept of a cut result, input field or host block |
+| `truncateHeadChars` | `300` | Characters kept of a cut result (head and tail), input field or host block |
 | `dropCalls` | `stub` | What becomes of an unneeded call: `stub` or `delete` |
 | `stubChars` | `120` | Characters of input kept on a stub |
 | `pruneMachineText` | `true` | Cut host blocks in old user messages |
 | `concurrency` | `4` | Requests in flight at once |
+| `arbiter` | none | A second `JevAsker` for the calls the judge was unsure about |
+| `arbitrateBand` | `0.15` | Half-width of the band around a threshold that goes to the arbiter |
 
 `result.stats` reports message and character counts before and after, how
 many characters were prunable at all, the per-reason decision counts, the
-largest request state in estimated tokens, and the number of requests.
+largest request state in estimated tokens, and the number of requests. Each
+entry of `result.decisions` carries both probabilities, whether the result
+question was asked, the result's size and a short `about` (the first string
+of the input), enough to audit a round after the fact.
 
 ## Limitations
 
@@ -146,15 +165,18 @@ largest request state in estimated tokens, and the number of requests.
   result is safe to cut. The assistant can always re-run the tool.
 - The judge sees each window with the frame around it, not the whole
   history at once; a result whose value only shows far away from its call
-  may be cut.
+  may be cut. The `superseded_by` hint covers the commonest case (the same
+  file read or edited again later); the plugin's `fork` backend shows the
+  judge the whole conversation instead.
 
 ## Claude Code plugin
 
 The repository root is a Claude Code function-hook plugin: `hooks/fast-jev.ts`
 is a thin adapter that feeds `session.compact` transcripts through `src/`,
 scored by Jev when `TYPESAFE_API_KEY` is set and otherwise by Claude (Haiku
-by default) through the session's own API client, and falls back to Claude
-Code's built-in summary on errors. See [`hooks/README.md`](hooks/README.md) for configuration and the
+by default) through the session's own API client, or by a fork of the
+session itself (`backend: fork`), and falls back to Claude Code's built-in
+summary on errors or after `timeoutMs`. See [`hooks/README.md`](hooks/README.md) for configuration and the
 Claude Code 2.1.274 type reference.
 
 ### Install in Claude Code
@@ -198,10 +220,20 @@ npm test
 npm run build
 npm run validate:plugin  # claude plugin validate
 TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run demo
+TYPESAFE_API_KEY="$(cat ~/.typesafe_key)" npm run calibrate -- [session.jsonl]
 ```
 
 The unit tests use a fake Jev and never contact TypeSafe. The demo is the live
 network check.
+
+`npm run calibrate` scores a real Claude Code transcript (the newest under
+`~/.claude/projects` unless a path is given) twice on the same windows, with
+the short questions the library sends and with the long ones that spelled
+the rubric out per question, and prints how the probabilities fell under
+each, what the thresholds 0.5, 0.3 and 0.2 would do, the mean per tool, and
+the calls where the two phrasings disagree most. Run it before moving
+`keepCallThreshold`; `--dry` only plans the windows. `examples/session.ts`
+is the transcript reader, usable on its own.
 
 ## Animated demo (macOS)
 
