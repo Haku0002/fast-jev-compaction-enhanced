@@ -44,9 +44,9 @@ class EfficientTests(unittest.TestCase):
         self.assertTrue(result['results'])
 
     def test_acknowledged_refs_only_suppress_exact_evidence(self):
-        first = self.shelf.lookup('p', 'cache')
+        first = self.shelf.lookup('p', 'cache', limit=1)
         refs = [r['ref'] for r in first['results']]
-        second = self.shelf.lookup('p', 'cache', known_refs=refs)
+        second = self.shelf.lookup('p', 'cache', limit=1, known_refs=refs)
         self.assertEqual(second['status'], 'already_in_context')
         self.assertEqual(second['results'], [])
         self.assertEqual(second['sources'], {})
