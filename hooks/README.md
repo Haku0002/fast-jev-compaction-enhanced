@@ -12,6 +12,11 @@ person's and the assistant's text is never touched.
 
 - **Jev** (TypeSafe System One) over `$.http.fetch`, when `TYPESAFE_API_KEY`
   is set (or `backend: jev`). Windows of 25k tokens, under Jev's 32k limit.
+- **OpenAI** over `$.http.fetch` to the Responses API (`backend: openai`).
+  Requires an explicitly configured `openaiModel` and `openaiApiKey` or
+  `OPENAI_API_KEY`. Answers use a strict schema; unavailable answers preserve
+  the affected calls. Its windows use the conservative library defaults.
+  An OpenAI credential alone does not change the `auto` backend.
 - **Claude** over `$.model.complete`, the session's own API client, when no
   key is set (or `backend: claude`). No extra key or billing; `claudeModel`
   picks the model (`haiku` by default) and the windows default to 80k

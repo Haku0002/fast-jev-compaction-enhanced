@@ -1,9 +1,14 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.6.0",
-  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
+  "version": "0.7.0",
+  "description": "Tool-call compaction for Claude Code and OpenAI API agents, with Codex export adapters and optional retrieval.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Haku0002/fast-jev-compaction-enhanced.git"
+  },
+  "bin": { "fast-jev-compact": "./dist/cli.js" },
   "engines": {
     "node": ">=18"
   },
@@ -16,7 +21,15 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs",
+    "retrieval/memory-shelf/*.py",
+    "retrieval/memory-shelf/README.md",
+    "retrieval/memory-shelf/requirements.txt",
+    "retrieval/memory-shelf/*LICENSE*.txt",
+    "retrieval/memory-shelf/benchmarks/*.json",
+    "retrieval/memory-shelf/benchmarks/*.md",
+    "retrieval/memory-shelf/benchmarks/*LICENSE*.txt"
   ],
   "scripts": {
     "build": "tsc",

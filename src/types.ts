@@ -296,6 +296,8 @@ export type JevAnswer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
 export interface JevResponse {
   model?: string;
   answers: Record<string, JevAnswer>;
+  /** Questions the judge explicitly declined to score; their calls stay verbatim. */
+  unscored?: string[];
   usage?: {
     input_tokens?: number;
     output_tokens?: number;

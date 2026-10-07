@@ -1,15 +1,15 @@
 {
   "name": "fast-jev-compaction",
   "owner": {
-    "name": "tamaratran",
-    "url": "https://github.com/tamaratran"
+    "name": "Haku0002",
+    "url": "https://github.com/Haku0002"
   },
   "plugins": [
     {
       "name": "fast-jev-compaction",
       "source": "./",
       "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself.",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "license": "MIT"
     }
   ]

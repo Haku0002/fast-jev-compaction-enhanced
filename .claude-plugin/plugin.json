@@ -1,13 +1,14 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself (no extra key).",
   "license": "MIT",
+  "author": { "name": "Haku0002", "url": "https://github.com/Haku0002" },
   "userConfig": {
     "backend": {
       "type": "string",
       "title": "Judge backend",
-      "description": "Who scores the tool calls: 'claude' uses the session's own API client via $.model.complete (no key needed); 'fork' uses $.model.fork, a completion over the session's own cached transcript, so the judge sees the whole conversation at almost no input cost (experimental; falls back to the built-in summary when the fork is unavailable); 'jev' uses TypeSafe Jev over HTTP; 'auto' picks jev when a TypeSafe key is set, else claude.",
+      "description": "Who scores the tool calls: 'claude' uses the session API client; 'fork' uses the session transcript (experimental); 'jev' uses TypeSafe; 'openai' uses the OpenAI Responses API with explicit openaiModel and its own key; 'auto' picks jev when a TypeSafe key is set, else claude.",
       "default": "auto"
     },
     "arbiterModel": {
@@ -33,6 +34,17 @@
       "title": "Claude judge model",
       "description": "Model alias or id for the Claude judge (backend=claude), e.g. haiku.",
       "default": "haiku"
+    },
+    "openaiModel": {
+      "type": "string",
+      "title": "OpenAI judge model",
+      "description": "Explicit model id for backend=openai. No model is selected automatically."
+    },
+    "openaiApiKey": {
+      "type": "string",
+      "title": "OpenAI API key",
+      "description": "Only for backend=openai. Leave unset to use OPENAI_API_KEY.",
+      "sensitive": true
     },
     "apiKey": {
       "type": "string",

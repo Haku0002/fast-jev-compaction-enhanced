@@ -1,0 +1,173 @@
+{
+  "commit": "972cfaae3f1349a2b822a0003e96e980c59a402f",
+  "project": "cpython-docs-972cfaae",
+  "created_at": "2026-09-26T20:06:50.847816+00:00",
+  "cases_sha256": "97ddf30213f8dadba8880e7ae000cb0c112bb37e9653f6b5a94140af25b1a187",
+  "cases": [
+    {
+      "id": "en01",
+      "group": "english",
+      "query": "Why can a background coroutine task vanish before it finishes if I do not keep it in a collection?",
+      "source": "Doc/library/asyncio-task.rst",
+      "anchor": "weak references to tasks"
+    },
+    {
+      "id": "en02",
+      "group": "english",
+      "query": "My child process writes lots of output into a pipe and waiting for it never returns. How should I collect its output without hanging?",
+      "source": "Doc/library/subprocess.rst",
+      "anchor": "This will deadlock when using"
+    },
+    {
+      "id": "en03",
+      "group": "english",
+      "query": "On Windows, how can I reopen a named temporary file while its original handle is still open and keep automatic cleanup?",
+      "source": "Doc/library/tempfile.rst",
+      "anchor": "delete_on_close* is false"
+    },
+    {
+      "id": "en04",
+      "group": "english",
+      "query": "Is loading a pickled object received from a stranger safe, or can deserializing it execute code?",
+      "source": "Doc/library/pickle.rst",
+      "anchor": "arbitrary code during unpickling"
+    },
+    {
+      "id": "en05",
+      "group": "english",
+      "query": "Can I share a SQLite connection with a worker thread different from the thread that created it, and what protects writes?",
+      "source": "Doc/library/sqlite3.rst",
+      "anchor": "write operations may need to be serialized"
+    },
+    {
+      "id": "en06",
+      "group": "english",
+      "query": "Why does my logging message appear twice after I attach handlers to both a child logger and its parent?",
+      "source": "Doc/library/logging.rst",
+      "anchor": "emit the same record multiple times"
+    },
+    {
+      "id": "en07",
+      "group": "english",
+      "query": "Does a cached property guarantee its getter runs exactly once when several threads access the same instance at the same time?",
+      "source": "Doc/library/functools.rst",
+      "anchor": "The getter function could run more than once"
+    },
+    {
+      "id": "en08",
+      "group": "english",
+      "query": "If a function cache is thread safe, can simultaneous calls with identical arguments still execute the underlying function twice?",
+      "source": "Doc/library/functools.rst",
+      "anchor": "wrapped function to be called more than once"
+    },
+    {
+      "id": "en09",
+      "group": "english",
+      "query": "I saved the group iterators while walking grouped records, but earlier groups are empty later. How can I keep their contents?",
+      "source": "Doc/library/itertools.rst",
+      "anchor": "previous group is no longer visible"
+    },
+    {
+      "id": "en10",
+      "group": "english",
+      "query": "How do I make a heap priority queue preserve insertion order on equal priorities without comparing the task objects themselves?",
+      "source": "Doc/library/heapq.rst",
+      "anchor": "The entry count serves as"
+    },
+    {
+      "id": "en11",
+      "group": "english",
+      "query": "How can every dataclass instance get its own fresh list instead of sharing one mutable default value?",
+      "source": "Doc/library/dataclasses.rst",
+      "anchor": "field(default_factory=list)"
+    },
+    {
+      "id": "en12",
+      "group": "english",
+      "query": "Which clock should I use to measure elapsed duration when the user may change the system time, and can I interpret its value as a calendar date?",
+      "source": "Doc/library/time.rst",
+      "anchor": "clock is not affected by system clock updates"
+    },
+    {
+      "id": "en13",
+      "group": "english",
+      "query": "When daylight saving time moves the clock backward and the same local hour occurs twice, how do I select the earlier or later offset?",
+      "source": "Doc/library/zoneinfo.rst",
+      "anchor": "fold=0"
+    },
+    {
+      "id": "en14",
+      "group": "english",
+      "query": "If JSON text contains the same object key twice, does the default decoder reject it or keep one of the values?",
+      "source": "Doc/library/json.rst",
+      "anchor": "the last name-value pair for a given name"
+    },
+    {
+      "id": "en15",
+      "group": "english",
+      "query": "Why might saving an exception value inside a custom thread exception hook keep objects alive unexpectedly?",
+      "source": "Doc/library/threading.rst",
+      "anchor": "can create a reference cycle"
+    },
+    {
+      "id": "en16",
+      "group": "english",
+      "query": "Will registered exit cleanup callbacks still execute if the process is killed by an unhandled signal or terminates with os._exit?",
+      "source": "Doc/library/atexit.rst",
+      "anchor": "Exit handlers are not called when"
+    },
+    {
+      "id": "zh01",
+      "group": "chinese",
+      "query": "后台协程任务还没做完就消失了，是不是必须自己保存任务对象的引用？",
+      "source": "Doc/library/asyncio-task.rst",
+      "anchor": "weak references to tasks"
+    },
+    {
+      "id": "zh02",
+      "group": "chinese",
+      "query": "父子 logger 都装了 handler，同一条日志为什么会出现两遍？",
+      "source": "Doc/library/logging.rst",
+      "anchor": "emit the same record multiple times"
+    },
+    {
+      "id": "zh03",
+      "group": "chinese",
+      "query": "怎么测量一段程序的耗时，才能不受电脑系统时间被修改的影响？",
+      "source": "Doc/library/time.rst",
+      "anchor": "clock is not affected by system clock updates"
+    },
+    {
+      "id": "zh04",
+      "group": "chinese",
+      "query": "JSON 对象里同一个键出现两次，默认解析器究竟保留前一个还是后一个？",
+      "source": "Doc/library/json.rst",
+      "anchor": "the last name-value pair for a given name"
+    },
+    {
+      "id": "absent01",
+      "group": "absent",
+      "query": "What is the exact installation folder of the 007 game on this user's Windows PC?",
+      "source": null,
+      "anchor": null
+    },
+    {
+      "id": "absent02",
+      "group": "absent",
+      "query": "What was the bank account number on the private invoice the user received yesterday?",
+      "source": null,
+      "anchor": null
+    }
+  ],
+  "conditions": {
+    "chunk_chars": 1400,
+    "overlap_chars": 160,
+    "candidate_cap": 12,
+    "per_source_candidate_cap": 4,
+    "output_budget_chars": 12000,
+    "output_limit": 10,
+    "jev_timeout_seconds": 12,
+    "retries": 0,
+    "negative_high_score_threshold": 0.8
+  }
+}

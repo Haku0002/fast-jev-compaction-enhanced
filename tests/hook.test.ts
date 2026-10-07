@@ -159,6 +159,25 @@ describe('session message mapping', () => {
 });
 
 describe('compactSession', () => {
+  it('supports an explicit OpenAI backend with a separate key and model', async () => {
+    const config = resolveHookConfig({ backend: 'openai', openaiModel: 'chosen-model', openaiApiKey: 'openai-test-key', apiKey: 'typesafe-test-key', preserveRecentMessages: 1 });
+    const requests: { url: string; body: Record<string, unknown>; authorization?: string }[] = [];
+    const { result } = await compactSession(transcript(), config, {
+      fetch: async (url, init) => {
+        const body = JSON.parse(init!.body!) as Record<string, unknown>;
+        requests.push({ url, body, authorization: init?.headers?.authorization });
+        const data = JSON.parse(body.input as string) as { questions: Record<string, unknown> };
+        return { ok: true, status: 200, text: JSON.stringify({ status: 'completed', output_text: JSON.stringify({ answers: Object.fromEntries(Object.keys(data.questions).map((name) => [name, 0.9])) }) }) };
+      },
+    });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ url: 'https://api.openai.com/v1/responses', authorization: 'Bearer openai-test-key', body: { model: 'chosen-model', store: false } });
+    expect(result.stats.arbitrated).toBe(0);
+    await expect(compactSession(transcript(), { ...config, openaiApiKey: undefined }, { fetch: jevFetch(() => 0) })).rejects.toThrow(/OPENAI_API_KEY/);
+    await expect(compactSession(transcript(), { ...config, openaiModel: undefined }, { fetch: jevFetch(() => 0) })).rejects.toThrow(/openaiModel/);
+    expect(selectBackend(resolveHookConfig({ openaiApiKey: 'k' }))).toBe('claude');
+  });
+
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const bodies: string[] = [];
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };

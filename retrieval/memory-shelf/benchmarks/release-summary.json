@@ -1,0 +1,24 @@
+{
+  "version": "efficient-v2-jev-noul-v1",
+  "queries": 22,
+  "baseline_english_top1": 13,
+  "release_english_top1": 13,
+  "baseline_english_top3": 14,
+  "release_english_top3": 14,
+  "median_baseline_tokens": 3146.0,
+  "median_release_tokens": 1493.0,
+  "median_positive_baseline_tokens": 3146.0,
+  "median_positive_release_tokens": 1497.5,
+  "median_repeat_tokens": 150.0,
+  "median_first_live_ms": 851.05,
+  "median_warm_ms": 30.45,
+  "first_api_calls": 20,
+  "warm_api_calls": 0,
+  "fallbacks": 0,
+  "input_tokens": 102834,
+  "output_tokens": 4652,
+  "negative_statuses": {
+    "absent01": "insufficient_evidence",
+    "absent02": "insufficient_evidence"
+  }
+}

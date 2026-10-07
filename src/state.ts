@@ -7,11 +7,12 @@ import type {
   ToolCall,
   ToolResult,
 } from './types.js';
+import { sliceText } from './text.js';
 
 /**
  * What the two questions about a call mean. Stated once, in the state's
- * context (and the Claude judge's system prompt), so each question can be a
- * short sentence instead of repeating the rubric.
+ * context and judge prompts. The calibrated Jev questions also repeat their
+ * criterion; removing that repetition changed retention scores in evaluation.
  */
 export const STATE_RUBRIC =
   'A `call_<id>` question asks whether the tool call itself still carries information the current task depends on: a file or command being worked with, a decision, a constraint, an edit that was made. A `result_<id>` question asks whether the full output of that call holds information the assistant would need again to continue correctly (an error message, a value, file contents it is editing, a constraint), beyond what re-running the tool would give.';
@@ -73,13 +74,14 @@ export function estimateTokens(text: string): number {
 }
 
 export function truncate(text: string, limit: number): string {
-  return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`;
+  return text.length <= limit ? text : `${sliceText(text, 0, Math.max(0, limit - 1))}…`;
 }
 
 function abridge(text: string, head: number, tail: number): string {
   if (text.length <= head + tail + 40) return text;
-  const omitted = text.length - head - tail;
-  return `${text.slice(0, head)}\n[… ${omitted} chars omitted …]\n${text.slice(-tail)}`;
+  const first = sliceText(text, 0, head);
+  const last = tail > 0 ? sliceText(text, -tail) : '';
+  return `${first}\n[… ${text.length - first.length - last.length} chars omitted …]\n${last}`;
 }
 
 export function isPinned(
@@ -103,8 +105,8 @@ export function pruneMachineBlocks(text: string, headChars: number): string {
   return text.replace(MACHINE_BLOCK, (block: string, tag: string) =>
     block.length <= headChars + 120
       ? block
-      : `${block.slice(0, headChars)}\n[fast-jev-compaction truncated ${
-          block.length - headChars
+      : `${sliceText(block, 0, headChars)}\n[fast-jev-compaction truncated ${
+          block.length - sliceText(block, 0, headChars).length
         } chars of this <${tag}> block]\n</${tag}>`,
   );
 }
@@ -156,7 +158,7 @@ export function callTarget(tool: string, input: Record<string, unknown>): CallTa
     }
     return { key: `file:${file}` };
   }
-  const command = input['command'];
+  const command = input['command'] ?? input['cmd'];
   if (typeof command === 'string' && command.length > 0) return { key: `${tool}:${command.trim()}` };
   const pattern = input['pattern'];
   if (typeof pattern === 'string' && pattern.length > 0) {
@@ -195,8 +197,8 @@ export function collectToolCalls(
         callIndex,
         resultIndex: found.index,
         resultChars: text.length,
-        resultHead: collapse(text.length <= SHORT_RESULT ? text : text.slice(0, RESULT_HEAD + 40)),
-        resultTail: text.length <= SHORT_RESULT ? '' : collapse(text.slice(-(RESULT_TAIL + 40))),
+        resultHead: collapse(text.length <= SHORT_RESULT ? text : sliceText(text, 0, RESULT_HEAD + 40)),
+        resultTail: text.length <= SHORT_RESULT ? '' : collapse(sliceText(text, -(RESULT_TAIL + 40))),
         isError: found.result.isError ?? false,
         tombstone: isTombstone(text),
         pinned:
@@ -239,7 +241,7 @@ function resultLine(call: ToolCall): string {
   if (call.resultChars === 0) return `(empty, ${status})`;
   if (call.resultTail === '') return `${call.resultHead} (${status})`;
   const head = truncate(call.resultHead, RESULT_HEAD);
-  const tail = call.resultTail.slice(-RESULT_TAIL);
+  const tail = sliceText(call.resultTail, -RESULT_TAIL);
   return `${head} … ${tail} (${status}, ${call.resultChars} chars)`;
 }
 

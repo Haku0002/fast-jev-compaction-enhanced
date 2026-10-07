@@ -4,6 +4,11 @@ export * from './client.js';
 export * from './state.js';
 export * from './compact.js';
 export * from './messages.js';
+export * from './openai-asker.js';
+export * from './openai-client.js';
+export * from './codex-asker.js';
+export * from './responses.js';
+export * from './text.js';
 export {
   claudeAsker,
   forkAsker,

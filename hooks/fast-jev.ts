@@ -9,8 +9,9 @@ import type {
 } from 'claude-code';
 
 import { claudeAsker, DEFAULT_CLAUDE_MODEL, forkAsker, type Completer, type Forker } from '../src/claude-asker.js';
+import { openaiAsker, OpenAIRequestError } from '../src/openai-asker.js';
 import { compact, prunableShare, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, withRetry, withTimeout } from '../src/request.js';
+import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, retryAfterMs, withRetry, withTimeout } from '../src/request.js';
 import type {
   CallDecision,
   CompactOptions,
@@ -28,7 +29,7 @@ import type {
  * prompt cache, so the judge sees the whole conversation at no input cost;
  * `auto` picks `jev` when a key is set, else `claude`.
  */
-export type Backend = 'auto' | 'jev' | 'claude' | 'fork';
+export type Backend = 'auto' | 'jev' | 'claude' | 'fork' | 'openai';
 export type NothingToPrune = 'keep' | 'summary';
 
 const HOOK_DEFAULTS = {
@@ -73,6 +74,9 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** Explicit OpenAI backend only; never substitutes a TypeSafe key. */
+  openaiApiKey?: string;
+  openaiModel?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -103,7 +107,7 @@ function optionString(options: PluginOptions, key: string): string | undefined {
 }
 
 function resolveBackend(value: string | undefined): Backend {
-  return value === 'jev' || value === 'claude' || value === 'fork' ? value : HOOK_DEFAULTS.backend;
+  return value === 'jev' || value === 'claude' || value === 'fork' || value === 'openai' ? value : HOOK_DEFAULTS.backend;
 }
 
 function resolveDropCalls(value: string | undefined): DropCalls | undefined {
@@ -151,6 +155,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   }
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const openaiApiKey = optionString(options, 'openaiApiKey');
+  if (openaiApiKey) config.openaiApiKey = openaiApiKey;
+  const openaiModel = optionString(options, 'openaiModel');
+  if (openaiModel) config.openaiModel = openaiModel;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
@@ -258,7 +266,7 @@ export function selectBackend(config: HookConfig): Exclude<Backend, 'auto'> {
 /** The library options for the selected judge: the Claude judges get wider windows unless set. */
 export function libraryOptions(config: HookConfig): CompactOptions {
   const backend = selectBackend(config);
-  if (backend === 'jev') return config;
+  if (backend === 'jev' || backend === 'openai') return config;
   const wide = backend === 'fork' ? [FORK_STATE_TOKENS, FORK_REQUEST_TOKENS] : [CLAUDE_STATE_TOKENS, CLAUDE_REQUEST_TOKENS];
   return {
     ...config,
@@ -278,7 +286,20 @@ export type Judges = {
 export function pickAsker(config: HookConfig, judges: Judges): JevAsker {
   const backend = selectBackend(config);
   let asker: JevAsker;
-  if (backend === 'fork') {
+  if (backend === 'openai') {
+    if (!config.openaiApiKey) throw new Error('OPENAI_API_KEY is not configured');
+    if (!config.openaiModel) throw new Error('openaiModel must be explicitly configured');
+    asker = openaiAsker((request) => withRetry(async () => {
+      const response = await judges.fetch('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${config.openaiApiKey}`, 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      if (!response.ok) throw new OpenAIRequestError(response.status, retryAfterMs(response.headers));
+      try { return JSON.parse(response.text) as unknown; }
+      catch { throw new Error('OpenAI endpoint returned malformed JSON'); }
+    }, { sleep: judges.sleep }), { model: config.openaiModel });
+  } else if (backend === 'fork') {
     if (!judges.fork) throw new Error('fork judge needs $.model.fork');
     asker = forkAsker(judges.fork);
   } else if (backend === 'claude') {
@@ -440,14 +461,16 @@ export function shouldCompact(
 type Env = { env: { get: (name: string) => Promise<string | undefined> } };
 type SettingsReader = { settings: { read: () => Promise<Readonly<Record<string, unknown>>> } };
 
-async function getApiKey($: Env & SettingsReader, config: HookConfig): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+async function getApiKey($: Env & SettingsReader, key: 'TYPESAFE_API_KEY' | 'OPENAI_API_KEY', configured?: string): Promise<string | undefined> {
+  if (configured) return configured;
+  const fromEnv = key === 'OPENAI_API_KEY'
+    ? await $.env.get('OPENAI_API_KEY')
+    : await $.env.get('TYPESAFE_API_KEY');
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    const value = (env as Record<string, unknown>)[key];
     if (typeof value === 'string' && value) return value;
   }
   return undefined;
@@ -530,7 +553,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
     const quiet = event.trigger === 'precompute' || event.agentId !== undefined;
     const tag = `[${event.trigger}${event.agentId ? ` ${event.agentId}` : ''}]`;
     try {
-      const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
+      const config: HookConfig = { ...configured };
+      if (config.backend === 'openai') config.openaiApiKey = await getApiKey($, 'OPENAI_API_KEY', configured.openaiApiKey);
+      else config.apiKey = await getApiKey($, 'TYPESAFE_API_KEY', configured.apiKey);
       if (event.instructions) {
         config.goal = config.goal ? `${event.instructions}\n${config.goal}` : event.instructions;
       }

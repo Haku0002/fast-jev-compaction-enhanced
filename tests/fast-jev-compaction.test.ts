@@ -141,6 +141,23 @@ describe('options', () => {
   });
 });
 
+describe('Jev alias lifecycle', () => {
+  it('keeps requesting latest when the returned version changes, and makes preview explicit', async () => {
+    const models: string[] = [];
+    let count = 0;
+    const fetcher: typeof fetch = async (_url, init) => {
+      models.push(JSON.parse(init?.body as string).model);
+      return Response.json({ model: count++ === 0 ? 'jev-1.13.0' : 'jev-1.14.0', answers: { q: { noul: 0.8 } } });
+    };
+    const client = new JevClient({ apiKey: 'test-key', fetch: fetcher });
+    const questions: JevQuestions = { q: { type: 'noul', instructions: 'q' } };
+    await client.ask({}, questions);
+    await client.ask({}, questions);
+    await new JevClient({ apiKey: 'test-key', model: 'jev-preview', fetch: fetcher }).ask({}, questions);
+    expect(models).toEqual(['jev-latest', 'jev-latest', 'jev-preview']);
+  });
+});
+
 describe('token estimate', () => {
   it('charges words, digits, CJK, dense runs and symbols separately', () => {
     expect(estimateTokens('')).toBe(0);

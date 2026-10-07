@@ -103,7 +103,7 @@ export function noulAnswer(
     !answer ||
     !('noul' in answer) ||
     typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul)
+    !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1
   ) {
     return undefined;
   }
@@ -177,7 +177,8 @@ export async function withRetry<T>(
       return await fn();
     } catch (error) {
       if (attempt >= retries || !isRetryable(error)) throw error;
-      const asked = error instanceof JevRequestError ? error.retryAfterMs : undefined;
+      const retryHint = error !== null && typeof error === 'object' && 'retryAfterMs' in error ? error.retryAfterMs : undefined;
+      const asked = typeof retryHint === 'number' && Number.isFinite(retryHint) && retryHint >= 0 ? retryHint : undefined;
       if (asked !== undefined && asked > maxDelayMs) throw error;
       await sleep(asked ?? delayMs * (attempt + 1));
     }

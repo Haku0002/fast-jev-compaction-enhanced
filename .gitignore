@@ -1,4 +1,9 @@
 node_modules
 dist
+__pycache__/
+*.pyc
+retrieval/**/data/
+.local-eval/
+.local-install/
 .env
 demo/JevDemo/build

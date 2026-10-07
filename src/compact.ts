@@ -1,4 +1,5 @@
 import { choiceAnswer, noulAnswer } from './request.js';
+import { sliceText } from './text.js';
 import {
   collectToolCalls,
   estimateTokens,
@@ -184,7 +185,7 @@ async function askRequest(
     {},
     ...request.calls.map((call) => questionsFor(call, options)),
   );
-  const { answers } = await asker.ask(request.state, questions, request.calls);
+  const { answers, unscored = [] } = await asker.ask(request.state, questions, request.calls);
   const scored = new Map<string, CallAnswer>();
   for (const call of request.calls) {
     if (options.primitive === 'choice') {
@@ -202,7 +203,7 @@ async function askRequest(
     if (keepResult === undefined) continue;
     scored.set(call.id, { keepCall, keepResult });
   }
-  if (scored.size === 0 && request.calls.length > 0) {
+  if (scored.size === 0 && request.calls.length > 0 && !Object.keys(questions).every((name) => unscored.includes(name))) {
     throw new Error(`Invalid Jev answers: none of ${Object.keys(questions).length} questions answered`);
   }
   return scored;
@@ -289,8 +290,10 @@ export function headTail(keepChars: number): { head: number; tail: number } {
 function truncatedResultText(text: string, isError: boolean, keepChars: number): string {
   if (text.length <= keepChars + 120) return text;
   const { head, tail } = headTail(keepChars);
-  const omitted = text.length - head - tail;
-  const kept = keepChars > 0 ? `${text.slice(0, head)}\n[…]\n${tail > 0 ? `${text.slice(-tail)}\n` : ''}` : '';
+  const keptHead = sliceText(text, 0, head);
+  const keptTail = tail > 0 ? sliceText(text, -tail) : '';
+  const omitted = text.length - keptHead.length - keptTail.length;
+  const kept = keepChars > 0 ? `${keptHead}\n[…]\n${tail > 0 ? `${keptTail}\n` : ''}` : '';
   return `${kept}[fast-jev-compaction truncated ${omitted} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
@@ -325,7 +328,8 @@ export function abridgeInput(
   for (const [key, value] of Object.entries(input)) {
     const text = typeof value === 'string' ? value : value !== null && typeof value === 'object' ? safeJson(value) : null;
     if (text !== null && text.length > headChars + 120) {
-      out[key] = `${text.slice(0, headChars)}\n[fast-jev-compaction omitted ${text.length - headChars} chars of this field]`;
+      const kept = sliceText(text, 0, headChars);
+      out[key] = `${kept}\n[fast-jev-compaction omitted ${text.length - kept.length} chars of this field]`;
       changed = true;
     } else out[key] = value;
   }
@@ -344,7 +348,7 @@ export function stubInput(input: Record<string, unknown>, chars: number): Record
       budget -= text.length;
       continue;
     }
-    out[key] = budget > 0 ? `${text.slice(0, budget)}…` : '…';
+    out[key] = budget > 0 ? `${sliceText(text, 0, budget)}…` : '…';
     changed = true;
     budget = 0;
   }
@@ -355,7 +359,7 @@ export function stubInput(input: Record<string, unknown>, chars: number): Record
 function briefInput(input: Record<string, unknown>): string {
   for (const value of Object.values(input)) {
     if (typeof value === 'string' && value.trim().length > 0) {
-      return value.replace(/\s+/g, ' ').slice(0, 60);
+      return sliceText(value.replace(/\s+/g, ' '), 0, 60);
     }
   }
   return '';

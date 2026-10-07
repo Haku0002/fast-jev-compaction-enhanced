@@ -1,18 +1,119 @@
-# fast-jev-compaction
+# fast-jev-compaction-enhanced
 
-Claude Code plugin that replaces the compaction summary with Jev decisions:
-every tool call and result is scored in one fast request, stale ones are
-dropped or truncated, everything kept stays verbatim. Also usable as an npm
-library.
+Jev-first tool-call compaction for Claude Code and OpenAI API agents, with an offline
+Codex history adapter and an optional Memory Shelf retrieval companion.
+Jev judges old tool records quickly; Claude or OpenAI can re-check uncertain
+calls. Kept content stays verbatim. Standalone Claude/OpenAI judges remain optional.
+
+This enhanced repository is maintained at
+[Haku0002/fast-jev-compaction-enhanced](https://github.com/Haku0002/fast-jev-compaction-enhanced).
+It retains the `fast-jev-compaction` package/plugin id for compatibility.
+The original is [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
+
+## OpenAI and Codex
+
+For an API agent that owns its Responses input history, keep Jev as the first
+judge and optionally use the signed-in Codex account as the arbiter:
+
+```ts
+import { compactResponsesInput, JevClient, codexAsker } from 'fast-jev-compaction';
+
+const result = await compactResponsesInput(input, new JevClient(), {
+  // credential: TYPESAFE_API_KEY; requested model always defaults to jev-latest
+  arbiter: codexAsker({
+    executable: process.env.CODEX_NATIVE_EXECUTABLE!,
+    model: process.env.OPENAI_COMPACTION_MODEL!, // explicitly selected
+  }),
+  arbitrateBand: 0.15,
+  concurrency: 1,
+});
+input = result.input;
+if (result.contextChanged) knownRefs = []; // if using Memory Shelf
+```
+
+`codexAsker` uses the official native Codex executable and its ChatGPT login in
+a temporary read-only scope; it does not extract OAuth tokens or rewrite a live
+thread. It rejects judging turns that use tools. The CLI equivalent is Jev plus
+`--arbiter-model MODEL_ID --codex-executable /path/to/native/codex`;
+`--codex-proxy URL` configures a proxy for that child only.
+
+For an OpenAI API credential, use `new OpenAIClient({ model })` as `arbiter`
+instead. Passing that client as the first judge opts into OpenAI-only scoring.
+An existing SDK client can instead use
+`openaiAsker(request => client.responses.create(request), { model })`.
+The judge requests strict structured JSON, uses `store: false`, and preserves
+calls it cannot score. Requests are bounded, rate-limit retries respect
+`Retry-After`, and incomplete/refused responses do not install a partial history.
+The OpenAI model has not been calibrated against the existing Jev default.
+
+The adapter preserves roles, assistant `phase`, item/call ids, metadata and
+opaque reasoning/compaction items. Multimodal, encrypted, malformed, duplicate
+or unfinished tool pairs stay untouched. Only complete text tool pairs are
+compacted, including Codex's pure `input_text` arrays. No hidden reasoning is
+extracted for judging or retrieval. See the [current-chat test](docs/current-chat-test.md)
+for the real-format bug found, the measured result and its limits.
+
+After `npm run build`, inspect a Codex JSONL export without requests:
+
+```sh
+node dist/cli.js --input session.jsonl --format codex --dry-run
+node dist/cli.js --input responses.json --format responses --judge jev --arbiter-model MODEL_ID --codex-executable /path/to/native/codex --output hybrid-input.json
+node dist/cli.js --input responses.json --format responses --judge openai --model MODEL_ID --output compacted-input.json
+```
+
+The hybrid command sends the fitted state first to TypeSafe, then only uncertain
+questions to OpenAI through Codex login. The OpenAI-only command requires `OPENAI_API_KEY`.
+The CLI defaults to Jev (`TYPESAFE_API_KEY`) when a judge is not specified. Optional
+`--arbiter-model MODEL_ID` uses OpenAI only for borderline Jev decisions.
+Without `--codex-executable`, that arbiter uses the direct OpenAI HTTP client.
+`--judge codex --model MODEL_ID --codex-executable PATH` is an optional standalone
+Codex-login judge. None of these options changes the Jev-first default.
+Output must be a separate new file. These commands export a copy rather than installing it into a live session.
+
+The production Jev alias is `jev-latest`; `jev-preview` is an explicit experiment.
+Response model labels are diagnostics and are never pinned back into subsequent
+requests. [Official model discovery](https://api.typesafe.ai/docs) lists names
+and aliases available to the authenticated account. See the
+[Jev/arbiter comparison](docs/jev-current-chat-test.md) for actual alias checks,
+stage costs and current limitations.
+
+**Stock Codex desktop/CLI `/compact` is not replaced by this library.** Its
+public hooks do not accept replacement history. The adapter supports offline
+exports and API agents that control their input. See the
+[integration design](docs/openai-codex.md) and
+[official Codex hook interface](https://learn.chatgpt.com/docs/hooks).
+
+Claude Code's native hook remains supported. To select OpenAI there, explicitly
+set `backend: openai`, `openaiModel` and either `openaiApiKey` or `OPENAI_API_KEY`.
+`auto` and the existing Jev/Claude arbitration behavior retain their previous
+defaults. Using an OpenAI key alone does not switch providers.
+
+## Optional retrieval companion
+
+[Install in Codex](docs/install-codex.md) to run the companion from an independent
+versioned runtime. Registration exposes project discovery, search, original-text
+read and statistics through the client's normal MCP interface.
+
+[Memory Shelf](retrieval/memory-shelf/README.md) preserves original text in a
+versioned SQLite/FTS store and retrieves a few bounded excerpts through CLI or
+MCP. It keeps ranking caches, explicit evidence references and an
+`insufficient_evidence` outcome. Its default is local retrieval; external Jev
+reranking requires explicit opt-in and, for MCP, an approved snapshot manifest.
+
+The prior experiment's code, reports and limitations were consolidated in
+[the preserved project history](docs/legacy-memory-shelf.md). Historical token
+and latency results are not a new OpenAI benchmark. This machine's verified
+public index has a local backup excluded from Git and npm. Credentials and
+automatic session-ingestion behavior were not copied.
 
 ## What and why
 
 Most context compaction asks an LLM to summarize old turns. A summary is
 lossy: a file path, exact error, constraint, or command can disappear even when
-it matters later. This library never rewrites anything. It only deletes tool
-calls and tool results Jev says are no longer needed, and it asks Jev while
-showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+it matters later. This library scores old tool records in bounded windows and
+keeps, truncates or stubs them. Kept records, the person's text and assistant
+narration stay verbatim and in order. Removing information can still lose a
+fact needed later; verbatim retention is not a guarantee of lossless compaction.
 
 The repository is both an npm package (`src/`) and a Claude Code plugin
 (`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
