@@ -1,8 +1,9 @@
-"""Read-only MCP adapter. Imports are explicit CLI operations, not background scans."""
+"""Retrieval MCP adapter. Imports are explicit CLI operations, not background scans."""
 import os
 import json
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from shelf import DEFAULT_DB
 from efficient import EfficientShelf
 
@@ -14,15 +15,21 @@ mcp = FastMCP('memory-shelf', instructions=(
     'No result proves no absence. These tools supplement retrieval, not conversation memory.'))
 
 
-def run(method, *args, **kwargs):
-    shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)))
+LOCAL_READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                             openWorldHint=False, idempotentHint=True)
+SEARCH = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                         openWorldHint=True, idempotentHint=False)
+
+
+def run(method, *args, read_only=False, **kwargs):
+    shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)), read_only=read_only)
     try:
         return getattr(shelf, method)(*args, **kwargs)
     finally:
         shelf.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=SEARCH)
 def memory_search(project: str, query: str, limit: int = 3,
                   max_tokens: int = 2200, include_history: bool = False,
                   retrieval_query: str | None = None, known_refs: list[str] | None = None,
@@ -34,12 +41,14 @@ def memory_search(project: str, query: str, limit: int = 3,
     tracking. English retrieval_query can recall English documents for an original Chinese query.
     recall='expanded' is experimental; default classic preserves established candidate recall.
     An insufficient_evidence result calls for broader search, not an unsupported answer.
+    Search may update internal indexes/scoring caches and send the query and approved public
+    candidate text to Jev. It never imports or modifies archived source documents.
     """
     return run('lookup', project, query, retrieval_query, external_allowed(project),
                max_tokens, limit, 1400, known_refs, include_history, recall)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_READ)
 def memory_read(project: str, chunk_id: int, offset: int = 0, max_chars: int = 3000,
                 known_refs: list[str] | None = None) -> dict:
     """Read original archived text starting at a search chunk. Follow next_offset for more.
@@ -47,13 +56,13 @@ def memory_read(project: str, chunk_id: int, offset: int = 0, max_chars: int = 3
     Explicit project scope is mandatory. Offset is relative to the chunk start, in characters.
     is_latest means latest imported version, not a verification of the live external source.
     """
-    return run('read_evidence', project, chunk_id, offset, max_chars, known_refs)
+    return run('read_evidence', project, chunk_id, offset, max_chars, known_refs, read_only=True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_READ)
 def memory_projects() -> dict:
     """List explicitly imported project names and counts; no document text is returned."""
-    shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)))
+    shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)), read_only=True)
     try:
         projects = [dict(row) for row in shelf.db.execute('SELECT project,COUNT(*) AS revisions,COUNT(DISTINCT source) AS sources FROM documents GROUP BY project ORDER BY project')]
     finally:
@@ -62,10 +71,10 @@ def memory_projects() -> dict:
             'notice': 'Only explicitly imported material is available; missing projects are not evidence of machine-wide absence.'}
 
 
-@mcp.tool()
+@mcp.tool(annotations=LOCAL_READ)
 def memory_stats(project: str) -> dict:
     """Show number of explicitly imported sources, revisions and stored characters."""
-    return {**run('stats', project), 'jev_enabled_for_snapshot': external_allowed(project)}
+    return {**run('stats', project, read_only=True), 'jev_enabled_for_snapshot': external_allowed(project)}
 
 
 def external_allowed(project: str) -> bool:
@@ -79,7 +88,7 @@ def external_allowed(project: str) -> bool:
         allowed = json.loads(Path(path).read_text(encoding='utf-8')).get(project)
         if not isinstance(allowed, list):
             return False
-        shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)))
+        shelf = EfficientShelf(os.environ.get('MEMORY_SHELF_DB', str(DEFAULT_DB)), read_only=True)
         try:
             current = [dict(r) for r in shelf.db.execute(
                 'SELECT id,source,sha256 FROM documents WHERE project=? ORDER BY id', (project,))]

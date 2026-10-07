@@ -26,11 +26,16 @@ def terms(text: str) -> list[str]:
 
 
 class Shelf:
-    def __init__(self, path=DEFAULT_DB):
+    def __init__(self, path=DEFAULT_DB, read_only=False):
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, timeout=10)
+        if read_only:
+            self.db = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(path, timeout=10)
         self.db.row_factory = sqlite3.Row
+        if read_only:
+            return
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS documents (

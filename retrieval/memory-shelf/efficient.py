@@ -50,11 +50,13 @@ def excerpt(row, query, width):
 
 
 class EfficientShelf(Shelf):
-    def __init__(self, path=DEFAULT_DB, ranker=None, cache_ttl=3600, scorer_version=VERSION):
-        super().__init__(path)
+    def __init__(self, path=DEFAULT_DB, ranker=None, cache_ttl=3600, scorer_version=VERSION, read_only=False):
+        super().__init__(path, read_only=read_only)
         self.ranker = ranker or jev_rank
         self.cache_ttl = cache_ttl
         self.scorer_version = scorer_version
+        if read_only:
+            return
         self.db.executescript('''
             CREATE VIRTUAL TABLE IF NOT EXISTS expanded_index USING fts5(words, tokenize='porter unicode61');
             CREATE TABLE IF NOT EXISTS ranking_cache (

@@ -13,9 +13,11 @@ The standalone MCP installation is documented in [install-codex.md](install-code
 - `npm run typecheck` and `npm run build` pass.
 - `claude plugin validate .claude-plugin/plugin.json` passes. The host validator
   requires literal `$.env.get` names; both credential names are statically listed.
-- Python retrieval: 18 unit/policy tests pass, including project discovery, scorer-identity cache
-  invalidation and expired-cache cleanup.
-- MCP stdio smoke: the migrated server initializes and lists all three tools;
+- Python retrieval: 22 unit/policy tests pass with and without the optional
+  tokenizer. Coverage includes project discovery, scorer-identity cache,
+  expired-cache cleanup, advertised permissions, database read-only access and
+  empty-database provisioning for a fresh installation.
+- MCP stdio smoke: the migrated server initializes and lists all four tools;
   search/read and exact-reference dedup pass on the local public snapshot with
   zero external judge requests. `mcp_smoke.py` preserves that reproducible check.
 - CLI: a real child process posts to a loopback mock Responses server and writes
@@ -30,6 +32,13 @@ The standalone MCP installation is documented in [install-codex.md](install-code
   starts the independent Python runtime, lists four tools, completes a real
   `jev_live` query and a `jev_cache` repeat, and reads original evidence. No
   credential value is written to the runtime metadata or repository.
+- Native Codex acceptance: an ephemeral client uses that registered launcher
+  and its scoped search approval, completes five MCP calls across all four
+  tools, and answers the default alias as `jev-latest` with a pinned public
+  source. The first search is `jev_live` (one request, about 2.23 seconds);
+  repeating it is `jev_cache` (zero requests, about 10 milliseconds). Two
+  acknowledged evidence refs are suppressed. A previously unreturned third
+  chunk then fits the budget, so `status=ok` is correct rather than an error.
 
 ## Limits
 

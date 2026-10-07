@@ -47,6 +47,14 @@ def main():
                 source.backup(destination)
         finally:
             source.close()
+    if not db_path.exists():
+        # Provisioning, rather than read-only tools, owns creation of an empty shelf.
+        initialized = subprocess.run([str(interpreter), '-c',
+            'import sys; sys.path.insert(0,sys.argv[1]); from efficient import EfficientShelf; '
+            'shelf=EfficientShelf(sys.argv[2]); shelf.close()', str(server_dir), str(db_path)],
+            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
+        if initialized.returncode:
+            raise RuntimeError('Could not provision the empty retrieval database')
     if args.approved_manifest:
         approved = json.loads(args.approved_manifest.read_text(encoding='utf-8'))
         with sqlite3.connect(db_path) as db:
