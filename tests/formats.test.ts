@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyDecisions,
+  callTarget,
   chatAsker,
   collectToolCalls,
   compact,
@@ -9,7 +10,9 @@ import {
   decideCall,
   detectFormat,
   goalFromMessages,
+  isChange,
   isCompactSummary,
+  JevClient,
   parseJudgeReply,
   parseTranscript,
   probabilityOf,
@@ -436,6 +439,53 @@ describe('audit fixes', () => {
     const applied = applyDecisions(messages, [decideCall(calls[0]!, { keepCall: 0, keepResult: 0 }, options)], calls, options);
     expect(applied.messages[1]!.toolUses[0]!.text).toBeUndefined();
     expect(applied.messages[2]!.toolResults![0]!.text).toMatch(/dropped the 2000-char result/);
+  });
+
+  it('reads a code-mode program for what it is about, so supersede works under a run_code preset', () => {
+    // A code-mode agent calls its tools from inside one program, so the input is { code }
+    // and the file, command and pattern keys are nowhere to be found.
+    const read = (path: string) => ({ code: `const r = await tools.read({ file_path: '${path}' });\nreturn r;` });
+    expect(callTarget('run_code', read('C:\\repo\\a.ts'))).toEqual({ key: 'file:C:/repo/a.ts' });
+    expect(callTarget('run_code', { code: 'await tools.pwsh({ command: `npm   test` })' })).toEqual({ key: 'pwsh:npm test' });
+    // Several calls in one program: its own key, so an identical re-run still matches.
+    const multi = { code: 'await tools.read({ file_path: "a" }); await tools.read({ file_path: "b" });' };
+    const key = callTarget('run_code', multi)!.key;
+    expect(key).toMatch(/^code:[0-9a-f]+$/);
+    expect(callTarget('run_code', { code: multi.code.replace(/ /g, '  ') })!.key).toBe(key);
+    expect(callTarget('run_code', { code: 'await tools.read({ file_path: "a" }); await tools.read({ file_path: "c" });' })!.key).not.toBe(key);
+    // A program that writes is a change, so a later read does not supersede it.
+    expect(isChange('run_code', { code: 'await tools.write({ file_path: "a", content: "x" })' })).toBe(true);
+    expect(isChange('run_code', read('a'))).toBe(false);
+
+    const sup = (uses: Array<[string, Record<string, unknown>]>) => {
+      const m: Message[] = [{ role: 'user', text: 't', toolUses: [] }];
+      uses.forEach(([tool, input], i) => {
+        m.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `u${i}`, tool, input }] });
+        m.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `u${i}`, text: 'r' }] });
+      });
+      return collectToolCalls(m, 0)[0]!.supersededBy;
+    };
+    // Two programs reading the same file: the first is superseded.
+    expect(sup([['run_code', read('/a.ts')], ['run_code', read('/a.ts')]])).toBe('t2');
+    // A program and a direct call share the key space.
+    expect(sup([['run_code', read('/a.ts')], ['Read', { file_path: '/a.ts' }]])).toBe('t2');
+    // A writing program is not superseded by a later read of the same file.
+    expect(sup([['run_code', { code: 'await tools.write({ file_path: "/a.ts", content: "x" })' }], ['run_code', read('/a.ts')]])).toBeUndefined();
+    // Different programs do not supersede each other.
+    expect(sup([['run_code', read('/a.ts')], ['run_code', read('/b.ts')]])).toBeUndefined();
+  });
+
+  it('retries a dropped Jev connection instead of losing the round', async () => {
+    let calls = 0;
+    const flaky: typeof globalThis.fetch = async () => {
+      calls += 1;
+      if (calls < 3) throw new TypeError('fetch failed');
+      return new Response(JSON.stringify({ model: 'jev-latest', answers: { call_t1: { type: 'noul', noul: 0.4 } } }), { status: 200 });
+    };
+    const client = new JevClient({ apiKey: 'k', fetch: flaky, sleep: async () => undefined });
+    const response = await client.ask({ goal: 'g' }, { call_t1: { type: 'noul', instructions: 'a' } });
+    expect(response.answers.call_t1).toEqual({ type: 'noul', noul: 0.4 });
+    expect(calls).toBe(3);
   });
 
   it('does not leave an unhandled rejection when the sleeper rejects', async () => {

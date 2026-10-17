@@ -205,7 +205,76 @@ function normalisePath(path: string): string {
   return path.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
 }
 
+/**
+ * Fields that hold a whole program rather than one argument. A code-mode
+ * agent calls its tools from inside such a program (`run_code({ code })`),
+ * so the fields the other keys look for are nowhere in the input.
+ */
+const CODE_KEYS = ['code', 'program', 'source'];
+
+/** One `tools.<name>({ ... })` call a program makes, with a bounded window of its arguments. */
+interface InnerCall {
+  tool: string;
+  args: string;
+}
+
+/** The calls a program makes to its host's tools, up to a few. */
+function innerCalls(code: string): InnerCall[] {
+  const found: InnerCall[] = [];
+  const pattern = /\btools\.([A-Za-z_]\w*)\s*\(\s*\{/g;
+  for (let match = pattern.exec(code); match !== null; match = pattern.exec(code)) {
+    const from = match.index + match[0].length;
+    found.push({ tool: match[1]!, args: code.slice(from, from + 400) });
+    if (found.length >= 4) break;
+  }
+  return found;
+}
+
+/** The first of `keys` a program's argument window assigns a literal string to. */
+function fieldInArgs(args: string, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const match = new RegExp(`\\b${key}\\s*:\\s*(['"\`])([^'"\`]{1,400}?)\\1`).exec(args);
+    const value = match?.[2]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+/** A short stable digest (FNV-1a) of a program, so an identical re-run keys the same. */
+function fingerprint(code: string): string {
+  let hash = 0x811c9dc5;
+  const text = collapse(code);
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+/**
+ * What a code-mode program is about: the one tool call it makes, so it shares
+ * a key with a direct call on the same file or command, or the program itself,
+ * so an identical re-run supersedes the earlier one. A program that makes
+ * several calls keeps its own key: a later call on one of its files did not
+ * replace everything it did.
+ */
+function codeTarget(code: string): CallTarget | undefined {
+  const inner = innerCalls(code);
+  if (inner.length === 1) {
+    const only = inner[0]!;
+    const search = fieldInArgs(only.args, SEARCH_KEYS);
+    const file = fieldInArgs(only.args, FILE_KEYS);
+    if (file !== undefined && search === undefined) return { key: `file:${normalisePath(file)}` };
+    const command = fieldInArgs(only.args, COMMAND_KEYS);
+    if (command !== undefined) return { key: `${only.tool}:${collapse(command)}` };
+    if (search !== undefined) return { key: `${only.tool}:${search}:` };
+  }
+  return collapse(code).length > 0 ? { key: `code:${fingerprint(code)}` } : undefined;
+}
+
 export function callTarget(tool: string, input: Record<string, unknown>): CallTarget | undefined {
+  const code = firstString(input, CODE_KEYS);
+  if (code !== undefined) return codeTarget(code);
   const search = firstString(input, SEARCH_KEYS);
   const rawFile = firstString(input, FILE_KEYS);
   if (rawFile !== undefined && search === undefined) {
@@ -309,7 +378,13 @@ const CHANGE_TOOL = /(^|[_\W])(edit|write|patch|replace|create|insert|apply|dele
 
 /** Whether a call changes its target rather than reading it. */
 export function isChange(tool: string, input: Record<string, unknown>): boolean {
-  return CHANGE_TOOL.test(tool) || CHANGE_FIELDS.some((field) => field in input);
+  if (CHANGE_TOOL.test(tool) || CHANGE_FIELDS.some((field) => field in input)) return true;
+  // A code-mode program changes its target when any tool it calls does.
+  const code = firstString(input, CODE_KEYS);
+  if (code === undefined) return false;
+  return innerCalls(code).some(
+    (inner) => CHANGE_TOOL.test(inner.tool) || CHANGE_FIELDS.some((field) => new RegExp(`\\b${field}\\s*:`).test(inner.args)),
+  );
 }
 
 function inputText(input: Record<string, unknown>, limit: number): string {

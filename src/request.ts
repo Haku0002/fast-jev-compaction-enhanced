@@ -147,6 +147,19 @@ export function isRetryable(error: unknown): boolean {
   return RETRYABLE.test(error instanceof Error ? error.message : String(error));
 }
 
+/**
+ * A request that ran past the caller's own time budget, as opposed to a
+ * failure the server or the connection reported. Retrying one spends the
+ * budget again for the same slow server, so a caller that bounds its own wait
+ * excludes these from its retries.
+ */
+export class RequestTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RequestTimeoutError';
+  }
+}
+
 /** A pause on the host timer, cancelled by `signal`; none where the module has no timer. */
 export function defaultSleep(ms: number, options: { signal?: AbortSignal } = {}): Promise<void> {
   const g = globalThis as {
@@ -187,17 +200,20 @@ export async function withRetry<T>(
     delayMs?: number;
     maxDelayMs?: number;
     sleep?: (ms: number) => Promise<void>;
+    /** Which failures to try again; `isRetryable` by default. */
+    shouldRetry?: (error: unknown) => boolean;
   } = {},
 ): Promise<T> {
   const retries = options.retries ?? 1;
   const delayMs = options.delayMs ?? 1500;
   const maxDelayMs = options.maxDelayMs ?? 30_000;
   const sleep = options.sleep ?? defaultSleep;
+  const shouldRetry = options.shouldRetry ?? isRetryable;
   for (let attempt = 0; ; attempt += 1) {
     try {
       return await fn();
     } catch (error) {
-      if (attempt >= retries || !isRetryable(error)) throw error;
+      if (attempt >= retries || !shouldRetry(error)) throw error;
       const retryHint = error !== null && typeof error === 'object' && 'retryAfterMs' in error ? error.retryAfterMs : undefined;
       const asked = typeof retryHint === 'number' && Number.isFinite(retryHint) && retryHint >= 0 ? retryHint : undefined;
       if (asked !== undefined && asked > maxDelayMs) throw error;
