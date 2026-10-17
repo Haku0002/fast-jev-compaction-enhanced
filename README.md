@@ -10,6 +10,60 @@ This enhanced repository is maintained at
 It retains the `fast-jev-compaction` package/plugin id for compatibility.
 The original is [tamaratran/fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
 
+## Any history format, any judge model
+
+`compactTranscript(history, asker, options)` detects the format of a history,
+scores its tool calls and writes the result back **in the same format**.
+Untouched items come back as the same objects, so ids, thinking blocks and
+signatures, reasoning fields and unknown provider metadata survive.
+
+| Format | Shape | Notes |
+| --- | --- | --- |
+| `anthropic` | Messages API `{ role, content }` with `tool_use` / `tool_result`; also Claude Code `.jsonl` lines | `thinking` blocks kept; a result holding an image is never cut |
+| `openai-chat` | Chat Completions `tool_calls` + `role: 'tool'`; legacy `function_call` | what DeepSeek, Qwen, Kimi, GLM, Mistral, Groq, OpenRouter, vLLM, Ollama speak; `reasoning_content` kept |
+| `gemini` | `{ role: 'user' \| 'model', parts }` with `functionCall` / `functionResponse` | id-less calls paired by name in order; a call carrying a `thoughtSignature` is never rewritten or removed |
+| `responses` | OpenAI Responses / Codex input items | see below (`compactResponsesInput`) |
+| `ai-sdk` | Vercel AI SDK style `tool-call` blocks + `role: 'tool'` (or `tool-result` parts) | an optional `source.kind` tag tells the person from host snapshots |
+| `messages` | this library's own `Message[]` | |
+
+```ts
+import { compactTranscript, chatAskerFor, JevClient } from 'fast-jev-compaction';
+
+const out = await compactTranscript(requestBody, new JevClient()); // or { messages: [...] }, a .jsonl array, …
+send({ ...requestBody, messages: out.history });
+```
+
+Judges: `JevClient` (default), `claudeAsker`, `openaiAsker`/`OpenAIClient`
+(Responses), `codexAsker`, and **`chatAsker`** for any OpenAI-compatible
+Chat Completions endpoint. `chatAskerFor('deepseek' | 'qwen' | 'moonshot' |
+'zhipu' | 'mistral' | 'groq' | 'together' | 'openrouter' | 'xai' | 'gemini' |
+'ollama' | 'lmstudio' | 'vllm', { model })` reads the provider's usual key
+variable. The chat judge drops `response_format`, then the system role, then
+`temperature` when an endpoint rejects them, and remembers what worked.
+
+Every chat-style judge reads its reply with `parseJudgeReply`, which skips
+`<think>` / `reasoning_content` blocks (even when they contain braces) and
+accepts fenced JSON, nested `{ answers }`, lists of `{ name, probability }`,
+`"85%"`, 0–100 scales, single quotes, comments, trailing commas, and as a
+last resort `name: 0.8` lines. `null` marks a question unscored.
+
+Hosts that cannot rewrite an assistant message (an append-only event log, a
+provider that signs calls) pass `rewriteInputs: false`: inputs stay
+byte-identical, `delete` becomes `stub`, and only results change. Per call, a
+format adapter sets `lockedInput` for the same effect, and `pinned` on a
+result that holds more than text. `result.aligned` lists the output message
+for each input message (`null` where one was removed), and every decision
+carries its native `tool_use_id`, so a host can map the result back onto its
+own store.
+
+### Host bridges
+
+This package stays host-neutral. Integration with a specific agent host lives
+in a separate bridge package that depends on this one, for example
+`dsh-jev-bridge` for DeepSeek Harness, which reads the host's session log,
+calls `compact` with `rewriteInputs: false` and appends the host's own
+replacement events.
+
 ## OpenAI and Codex
 
 For an API agent that owns its Responses input history, keep Jev as the first
@@ -244,7 +298,8 @@ put it in a source file.
 | `truncateHeadChars` | `300` | Characters kept of a cut result (head and tail), input field or host block |
 | `dropCalls` | `stub` | What becomes of an unneeded call: `stub` or `delete` |
 | `stubChars` | `120` | Characters of input kept on a stub |
-| `pruneMachineText` | `true` | Cut host blocks in old user messages |
+| `pruneMachineText` | `true` | Cut host blocks in old user messages, and old `transient` host messages |
+| `rewriteInputs` | `true` | Allow shortening call inputs; `false` keeps every call byte-identical and turns `delete` into `stub` |
 | `concurrency` | `4` | Requests in flight at once |
 | `arbiter` | none | A second `JevAsker` for the calls the judge was unsure about |
 | `arbitrateBand` | `0.15` | Half-width of the band around a threshold that goes to the arbiter |

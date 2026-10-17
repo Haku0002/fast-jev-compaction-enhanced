@@ -2,6 +2,7 @@ import { choiceAnswer, noulAnswer } from './request.js';
 import { sliceText } from './text.js';
 import {
   collectToolCalls,
+  cutHostText,
   estimateTokens,
   isPinned,
   isTombstone,
@@ -34,6 +35,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   dropCalls: 'stub',
   stubChars: 120,
   pruneMachineText: true,
+  rewriteInputs: true,
   concurrency: 4,
   arbitrateBand: 0.15,
   primitive: 'noul',
@@ -62,6 +64,8 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       typeof options.pruneMachineText === 'boolean'
         ? options.pruneMachineText
         : DEFAULT_OPTIONS.pruneMachineText,
+    rewriteInputs:
+      typeof options.rewriteInputs === 'boolean' ? options.rewriteInputs : DEFAULT_OPTIONS.rewriteInputs,
     concurrency: whole(options.concurrency, DEFAULT_OPTIONS.concurrency, 1),
     arbitrateBand: Math.max(0, finite(options.arbitrateBand, DEFAULT_OPTIONS.arbitrateBand)),
     primitive: options.primitive === 'choice' ? 'choice' : DEFAULT_OPTIONS.primitive,
@@ -154,19 +158,27 @@ export function decideCall(
   options: Pick<
     ResolvedCompactOptions,
     'keepThreshold' | 'keepCallThreshold' | 'dropCalls' | 'truncateHeadChars'
-  >,
+  > &
+    Partial<Pick<ResolvedCompactOptions, 'rewriteInputs'>>,
 ): CallDecision {
-  const base = { id: call.id, tool: call.tool, ...answer };
+  const base = {
+    id: call.id,
+    ...('tool_use_id' in call && typeof call.tool_use_id === 'string' ? { tool_use_id: call.tool_use_id } : {}),
+    tool: call.tool,
+    ...answer,
+  };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
   const asked = askResult(call, options);
-  if (asked && answer.keepResult >= options.keepThreshold) {
+  const callKept = answer.keepCall >= options.keepCallThreshold;
+  if (asked && answer.keepResult >= options.keepThreshold && (callKept || !answer.nested)) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
-  if (answer.keepCall >= options.keepCallThreshold) {
+  if (callKept) {
     // A result too short to cut is kept as it is; `drop_result` then only bounds the input.
     return { ...base, action: 'drop_result', reason: asked ? 'result_dropped' : 'kept' };
   }
-  return options.dropCalls === 'delete'
+  // A host that cannot rewrite the assistant message keeps every call: delete becomes stub.
+  return options.dropCalls === 'delete' && options.rewriteInputs !== false
     ? { ...base, action: 'drop_call', reason: 'call_dropped' }
     : { ...base, action: 'stub_call', reason: 'call_stubbed' };
 }
@@ -190,7 +202,14 @@ async function askRequest(
   for (const call of request.calls) {
     if (options.primitive === 'choice') {
       const answer = choiceAnswer(answers, `call_${call.id}`);
-      if (answer) scored.set(call.id, answer);
+      if (answer) {
+        scored.set(call.id, answer);
+        continue;
+      }
+      // A judge that cannot answer a choice (a chat model asked yes/no) may answer `call_*` as a
+      // probability that the call is still needed; read it as a noul answer without a result question.
+      const keepCall = noulAnswer(answers, `call_${call.id}`);
+      if (keepCall !== undefined) scored.set(call.id, { keepCall, keepResult: 0 });
       continue;
     }
     const keepCall = noulAnswer(answers, `call_${call.id}`);
@@ -203,8 +222,14 @@ async function askRequest(
     if (keepResult === undefined) continue;
     scored.set(call.id, { keepCall, keepResult });
   }
-  if (scored.size === 0 && request.calls.length > 0 && !Object.keys(questions).every((name) => unscored.includes(name))) {
-    throw new Error(`Invalid Jev answers: none of ${Object.keys(questions).length} questions answered`);
+  // Only a reply that responds to nothing is an error: a question answered, or explicitly marked
+  // unscored, means the judge did its job even if no call ends up fully scored.
+  const names = Object.keys(questions);
+  const responded = names.some(
+    (name) => unscored.includes(name) || noulAnswer(answers, name) !== undefined || choiceAnswer(answers, name) !== undefined,
+  );
+  if (scored.size === 0 && request.calls.length > 0 && !responded) {
+    throw new Error(`Invalid Jev answers: none of ${names.length} questions answered`);
   }
   return scored;
 }
@@ -231,8 +256,9 @@ async function arbitrate(
   requests: readonly PlannedRequest[],
   answers: ReadonlyMap<string, CallAnswer>,
   options: ResolvedCompactOptions,
-): Promise<Map<string, CallAnswer>> {
+): Promise<{ overrides: Map<string, CallAnswer>; asked: number; failed: number }> {
   const overrides = new Map<string, CallAnswer>();
+  let failed = 0;
   const work = requests
     .map((request) => ({
       state: request.state,
@@ -242,11 +268,16 @@ async function arbitrate(
       }),
     }))
     .filter((request) => request.calls.length > 0);
+  // The arbiter is a second opinion: a request it fails keeps the judge's answers instead of
+  // failing a round whose judge succeeded.
   const answered = await runLimited(work, options.concurrency, (request) =>
-    askRequest(arbiter, { state: request.state, calls: request.calls, tokens: 0 }, options),
+    askRequest(arbiter, { state: request.state, calls: request.calls, tokens: 0 }, options).catch(() => {
+      failed += 1;
+      return new Map<string, CallAnswer>();
+    }),
   );
   for (const map of answered) for (const [id, answer] of map) overrides.set(id, answer);
-  return overrides;
+  return { overrides, asked: work.reduce((sum, request) => sum + request.calls.length, 0), failed };
 }
 
 /**
@@ -299,11 +330,17 @@ function truncatedResultText(text: string, isError: boolean, keepChars: number):
   }; re-run the tool if needed]`;
 }
 
+/**
+ * A stubbed result as the history keeps it: a one-line note, unless the
+ * output is no longer than that note (a short `ok`, a one-line error), which
+ * then stays verbatim; a stub never makes the history longer.
+ */
 function stubResultText(text: string, isError: boolean): string {
   if (isTombstone(text)) return text;
-  return `[fast-jev-compaction dropped the ${text.length}-char result${
+  const note = `[fast-jev-compaction dropped the ${text.length}-char result${
     isError ? ' (error)' : ''
   } of this call; re-run the tool if needed]`;
+  return note.length < text.length ? note : text;
 }
 
 function safeJson(value: unknown): string {
@@ -352,7 +389,12 @@ export function stubInput(input: Record<string, unknown>, chars: number): Record
     changed = true;
     budget = 0;
   }
-  if (changed) out.note = '[fast-jev-compaction abridged this input]';
+  if (changed) {
+    // Never overwrite a real field: a tool may well take a `note` argument.
+    let key = 'note';
+    while (Object.hasOwn(input, key)) key = `_${key}`;
+    out[key] = '[fast-jev-compaction abridged this input]';
+  }
   return changed ? out : input;
 }
 
@@ -373,7 +415,21 @@ export function removedMarker(dropped: readonly Pick<ToolUse, 'tool' | 'input'>[
 
 export interface Applied {
   messages: Message[];
+  /** One entry per input message: its output, or `null` where it was removed. */
+  aligned: (Message | null)[];
   machineBlocksPruned: number;
+}
+
+/**
+ * The old host text a round may cut: a superseded host snapshot to its head,
+ * machine blocks in a user text of unknown origin. The person's words and
+ * host text marked as still needed stay verbatim.
+ */
+function prunedHostText(message: Message, headChars: number): string {
+  if (message.role !== 'user') return message.text;
+  if (message.author === 'transient') return cutHostText(message.text, headChars);
+  if (message.author === undefined) return pruneMachineBlocks(message.text, headChars);
+  return message.text;
 }
 
 /**
@@ -382,8 +438,8 @@ export interface Applied {
  * stub keeps the tool name with a short input and a note for the result; a
  * deleted call disappears with its result and marks the turn's narration.
  * Old user messages lose the bulk of their host blocks. Messages that lose
- * all their content are removed; untouched messages are returned as the
- * same objects they came in as.
+ * all their content are removed (`aligned` holds `null` in their place);
+ * untouched messages are returned as the same objects they came in as.
  */
 export function applyDecisions(
   messages: readonly Message[],
@@ -392,25 +448,34 @@ export function applyDecisions(
   options: Pick<
     ResolvedCompactOptions,
     'truncateHeadChars' | 'stubChars' | 'pruneMachineText' | 'preserveRecentMessages'
-  >,
+  > &
+    Partial<Pick<ResolvedCompactOptions, 'rewriteInputs'>>,
 ): Applied {
   const headChars = options.truncateHeadChars;
+  const rewriteAll = options.rewriteInputs !== false;
+  const locked = new Set<string>();
+  for (const message of messages) for (const tool of message.toolUses) if (tool.lockedInput) locked.add(tool.tool_use_id);
+  const canRewrite = (id: string): boolean => rewriteAll && !locked.has(id);
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
     const call = byId.get(decision.id);
-    if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
+    if (!call || decision.action === 'keep') continue;
+    // A call that cannot be rewritten has to stay, so a delete is applied as a stub.
+    const action = !canRewrite(call.tool_use_id) && decision.action === 'drop_call' ? 'stub_call' : decision.action;
+    actions.set(call.tool_use_id, action);
   }
-  const kept: Message[] = [];
+  const aligned: (Message | null)[] = [];
   let machineBlocksPruned = 0;
+  const kept = {
+    push(message: Message): void {
+      aligned.push(message);
+    },
+  };
   messages.forEach((message, index) => {
     let text = message.text;
-    if (
-      options.pruneMachineText &&
-      message.role === 'user' &&
-      !isPinned(index, messages.length, options.preserveRecentMessages)
-    ) {
-      const pruned = pruneMachineBlocks(text, headChars);
+    if (options.pruneMachineText && !isPinned(index, messages.length, options.preserveRecentMessages)) {
+      const pruned = prunedHostText(message, headChars);
       if (pruned !== text) {
         machineBlocksPruned += 1;
         text = pruned;
@@ -432,14 +497,21 @@ export function applyDecisions(
         return [];
       }
       const isError = tool.isError ?? false;
-      const original = tool.text ?? '';
-      const input =
-        action === 'stub_call' ? stubInput(tool.input, options.stubChars) : abridgeInput(tool.input, headChars);
+      const input = !canRewrite(tool.tool_use_id)
+        ? tool.input
+        : action === 'stub_call'
+          ? stubInput(tool.input, options.stubChars)
+          : abridgeInput(tool.input, headChars);
+      // The mirrored result text, when the transcript carries one, follows the result.
       const resultText =
-        action === 'stub_call' ? stubResultText(original, isError) : truncatedResultText(original, isError, headChars);
-      if (input === tool.input && resultText === original) return [tool];
-      const copy: ToolUse = { tool_use_id: tool.tool_use_id, tool: tool.tool, input, text: resultText };
-      if (tool.isError) copy.isError = true;
+        tool.text === undefined
+          ? undefined
+          : action === 'stub_call'
+            ? stubResultText(tool.text, isError)
+            : truncatedResultText(tool.text, isError, headChars);
+      if (input === tool.input && resultText === tool.text) return [tool];
+      const copy: ToolUse = { ...tool, input };
+      if (resultText !== undefined) copy.text = resultText;
       return [copy];
     });
     const toolResults = (message.toolResults ?? []).flatMap((result): ToolResult[] => {
@@ -450,10 +522,13 @@ export function applyDecisions(
       const resultText =
         action === 'stub_call' ? stubResultText(result.text, isError) : truncatedResultText(result.text, isError, headChars);
       if (resultText === result.text) return [result];
-      return [{ tool_use_id: result.tool_use_id, text: resultText, isError: result.isError }];
+      return [{ ...result, text: resultText }];
     });
     if (dropped.length > 0 && text.trim().length > 0) text = `${text}\n${removedMarker(dropped)}`;
-    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) return;
+    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+      aligned.push(null);
+      return;
+    }
     const unchanged =
       text === message.text &&
       toolUses.length === message.toolUses.length &&
@@ -466,9 +541,14 @@ export function applyDecisions(
     }
     const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
+    if (message.author !== undefined) rebuilt.author = message.author;
     kept.push(rebuilt);
   });
-  return { messages: kept, machineBlocksPruned };
+  return {
+    messages: aligned.filter((message): message is Message => message !== null),
+    aligned,
+    machineBlocksPruned,
+  };
 }
 
 /** Characters of text, tool input and tool output a message holds. */
@@ -483,14 +563,20 @@ export function messageChars(message: Message): number {
 export function prunableChars(
   messages: readonly Message[],
   calls: readonly ToolCall[],
-  options: Pick<ResolvedCompactOptions, 'truncateHeadChars' | 'pruneMachineText' | 'preserveRecentMessages'>,
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars' | 'pruneMachineText' | 'preserveRecentMessages'> &
+    Partial<Pick<ResolvedCompactOptions, 'rewriteInputs'>>,
 ): number {
   let total = 0;
-  for (const call of calls) if (!call.pinned) total += call.inputChars + call.resultChars;
+  const inputs = options.rewriteInputs !== false;
+  const locked = new Set<string>();
+  for (const message of messages) for (const tool of message.toolUses) if (tool.lockedInput) locked.add(tool.tool_use_id);
+  for (const call of calls) {
+    if (!call.pinned) total += (inputs && !locked.has(call.tool_use_id) ? call.inputChars : 0) + call.resultChars;
+  }
   if (options.pruneMachineText) {
     messages.forEach((message, index) => {
-      if (message.role !== 'user' || isPinned(index, messages.length, options.preserveRecentMessages)) return;
-      total += message.text.length - pruneMachineBlocks(message.text, options.truncateHeadChars).length;
+      if (isPinned(index, messages.length, options.preserveRecentMessages)) return;
+      total += Math.max(0, message.text.length - prunedHostText(message, options.truncateHeadChars).length);
     });
   }
   return total;
@@ -545,8 +631,11 @@ export async function compact(
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
   }
 
-  const overrides =
-    options.arbiter && answers.size > 0 ? await arbitrate(options.arbiter, requests, answers, resolved) : new Map<string, CallAnswer>();
+  const arbitration =
+    options.arbiter && answers.size > 0
+      ? await arbitrate(options.arbiter, requests, answers, resolved)
+      : { overrides: new Map<string, CallAnswer>(), asked: 0, failed: 0 };
+  const overrides = arbitration.overrides;
   let arbiterFlips = 0;
 
   const decisions = calls.map((call): CallDecision => {
@@ -554,7 +643,16 @@ export async function compact(
     if (call.pinned) return { ...decideCall(call, { keepCall: 1, keepResult: 1 }, resolved), ...about };
     const answer = answers.get(call.id);
     if (!answer) {
-      return { id: call.id, tool: call.tool, keepCall: 1, keepResult: 1, action: 'keep', reason: 'unscored', ...about };
+      return {
+        id: call.id,
+        tool_use_id: call.tool_use_id,
+        tool: call.tool,
+        keepCall: 1,
+        keepResult: 1,
+        action: 'keep',
+        reason: 'unscored',
+        ...about,
+      };
     }
     const override = overrides.get(call.id);
     if (!override) return { ...decideCall(call, answer, resolved), ...about };
@@ -566,6 +664,7 @@ export async function compact(
   const applied = applyDecisions(messages, decisions, calls, resolved);
   return {
     messages: applied.messages,
+    aligned: applied.aligned,
     decisions,
     stats: {
       messagesBefore: messages.length,
@@ -583,8 +682,10 @@ export async function compact(
       machineBlocksPruned: applied.machineBlocksPruned,
       stateTokens: requests.reduce((max, request) => Math.max(max, request.tokens), 0),
       requests: requests.length,
-      arbitrated: overrides.size,
+      arbitrated: arbitration.asked,
+      arbiterAnswered: overrides.size,
       arbiterFlips,
+      arbiterFailures: arbitration.failed,
       ms: Date.now() - started,
     },
   };

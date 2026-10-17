@@ -117,6 +117,7 @@ describe('options', () => {
       dropCalls: 'stub',
       stubChars: 120,
       pruneMachineText: true,
+      rewriteInputs: true,
       concurrency: 4,
       arbitrateBand: 0.15,
       primitive: 'noul',
@@ -275,10 +276,12 @@ describe('request planning', () => {
       result('g2', ''),
     ];
     const calls = collectToolCalls(messages, 0);
+    // A read is superseded by any later call on its file; an edit only by a later change to it,
+    // since a later read shows the new contents but not which edit made them.
     expect(calls.map((c) => [c.id, c.supersededBy])).toEqual([
       ['t1', 't3'],
       ['t2', undefined],
-      ['t3', 't5'],
+      ['t3', undefined],
       ['t4', 't6'],
       ['t5', undefined],
       ['t6', undefined],
@@ -820,7 +823,7 @@ describe('choice primitive', () => {
     const answers = {
       call_t2: { type: 'choice' as const, choice: 'keep', confidence: 0.7, probabilities: { keep: 0.7, stub: 0.3 } },
     };
-    expect(choiceAnswer(answers, 'call_t2')).toEqual({ keepCall: expect.closeTo(0.7), keepResult: 0 });
+    expect(choiceAnswer(answers, 'call_t2')).toEqual({ keepCall: expect.closeTo(0.7), keepResult: 0, nested: true });
     expect(choiceAnswer(answers, 'call_t9')).toBeUndefined();
     expect(choiceAnswer({ call_t3: { noul: 0.5 } }, 'call_t3')).toBeUndefined();
   });
@@ -829,6 +832,15 @@ describe('choice primitive', () => {
     const answers = {
       call_t1: { type: 'choice' as const, choice: 'stub', confidence: 1, probabilities: { keep_result: 0, keep: 0, stub: 1 } },
     };
-    expect(choiceAnswer(answers, 'call_t1')).toEqual({ keepCall: 0, keepResult: 0 });
+    expect(choiceAnswer(answers, 'call_t1')).toEqual({ keepCall: 0, keepResult: 0, nested: true });
+  });
+
+  it('never keeps the full result of a call the judge is sure to stub', () => {
+    const call = { id: 't1', tool: 'Read', pinned: false, resultChars: 2000, tombstone: false };
+    // P(stub) 0.99, P(keep_result) 0.01: keepResult given kept is 1, but the call itself goes.
+    const answer = choiceAnswer({ call_t1: { type: 'choice', choice: 'stub', confidence: 0.99, probabilities: { keep_result: 0.01, keep: 0, stub: 0.99 } } }, 'call_t1')!;
+    expect(decideCall(call, answer, defaults).action).toBe('stub_call');
+    // A noul answer is not conditional: a high keepResult keeps the result whatever keepCall says.
+    expect(decideCall(call, { keepCall: 0.1, keepResult: 0.9 }, defaults).action).toBe('keep');
   });
 });

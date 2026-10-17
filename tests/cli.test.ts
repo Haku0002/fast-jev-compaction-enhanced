@@ -36,6 +36,56 @@ async function inFixture(fn: (path: string) => Promise<void>): Promise<void> {
   }
 }
 
+describe('CLI other formats', () => {
+  it('detects a Chat Completions history and exports it in the same format', async () => {
+    const chat = [
+      { role: 'system', content: 'agent' },
+      { role: 'user', content: 'fix parser' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'a', type: 'function', function: { name: 'sh', arguments: '{"cmd":"npm test"}' } }] },
+      { role: 'tool', tool_call_id: 'a', content: 'start\n' + 'log '.repeat(500) + '\nFAIL parser' },
+      ...Array.from({ length: 7 }, (_, i) => ({ role: i % 2 ? 'user' : 'assistant', content: `later ${i}` })),
+    ];
+    let calls = 0;
+    const server = createServer((request, response) => {
+      let body = '';
+      request.on('data', (chunk) => { body += String(chunk); });
+      request.on('end', () => {
+        calls += 1;
+        expect(request.url).toBe('/v1/chat/completions');
+        const sent = JSON.parse(body) as { messages: { content: string }[] };
+        const names = [...sent.messages.at(-1)!.content.matchAll(/- ((?:call|result)_t\d+):/g)].map((m) => m[1]!);
+        const answers = Object.fromEntries(names.map((name) => [name, name.startsWith('call_') ? 0.9 : 0.1]));
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ choices: [{ message: { content: '<think>{}</think>' + JSON.stringify(answers) } }] }));
+      });
+    });
+    await new Promise<void>((finish) => server.listen(0, '127.0.0.1', finish));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected a local test endpoint');
+    try {
+      await inFixture(async (path) => {
+        const source = join(path, 'chat.json'), destination = join(path, 'out.json');
+        await writeFile(source, JSON.stringify({ model: 'x', messages: chat }));
+        const dry = await cli(['--input', source, '--dry-run']);
+        expect(JSON.parse(dry.stdout)).toMatchObject({ dryRun: true, format: 'openai-chat', calls: 1, candidates: 1 });
+        // A value may start with `--`; only a known flag in its place is a missing value.
+        const dashed = await cli(['--input', source, '--goal', '--keep the API stable', '--dry-run']);
+        expect(dashed.status).toBe(0);
+        const missing = await cli(['--input', source, '--goal', '--dry-run']);
+        expect(missing.stderr).toContain('missing its value');
+        const result = await cli(['--input', source, '--output', destination, '--judge', 'chat', '--model', 'judge-model', '--base-url', `http://127.0.0.1:${address.port}/v1`]);
+        expect(result.stderr).toBe('');
+        expect(result.status).toBe(0);
+        const exported = JSON.parse(await readFile(destination, 'utf8')) as { model: string; messages: { content: string }[] };
+        expect(exported.model).toBe('x');
+        expect(exported.messages[3]!.content).toMatch(/FAIL parser/);
+        expect(exported.messages[3]!.content).toMatch(/fast-jev-compaction truncated/);
+        expect(calls).toBe(1);
+      });
+    } finally { await new Promise<void>((finish, reject) => server.close((error) => error ? reject(error) : finish())); }
+  });
+});
+
 describe('CLI exported history', () => {
   it('supports offline Codex inspection and refuses an existing destination before judging', async () => {
     await inFixture(async (path) => {
