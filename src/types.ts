@@ -10,6 +10,12 @@ export interface ToolUse {
   input: Record<string, unknown>;
   text?: string;
   isError?: boolean;
+  /**
+   * The call itself must reach the provider exactly as it was (a Gemini
+   * `thoughtSignature` covers it, say): its input is never shortened and it
+   * is never deleted; only its result can change. Format adapters set it.
+   */
+  lockedInput?: boolean;
 }
 
 /** A tool_result block of a user message. */
@@ -17,6 +23,12 @@ export interface ToolResult {
   tool_use_id: string;
   text: string;
   isError?: boolean;
+  /**
+   * The output holds more than text (an image, a file, an opaque or signed
+   * part), so its call is never a candidate: the judge sees it, nothing
+   * changes it. Format adapters set it.
+   */
+  pinned?: boolean;
 }
 
 /**
@@ -28,7 +40,20 @@ export interface Message {
   text: string;
   toolUses: ToolUse[];
   toolResults?: ToolResult[];
+  /**
+   * Who wrote a user-side text, when a format adapter knows. `person` is the
+   * human (the default). `host` is harness text the history still needs
+   * (workspace instructions, a skill catalog, another agent's report, an
+   * earlier summary): kept verbatim, never taken as the goal. `transient` is
+   * harness text a later message supersedes (a runtime-context or time
+   * snapshot, a job notice): never the goal, and cut to a head when old.
+   * A message without it is treated as before: old machine blocks such as
+   * `<system-reminder>` in a user text are cut by rule.
+   */
+  author?: MessageAuthor;
 }
+
+export type MessageAuthor = 'person' | 'host' | 'transient';
 
 /** A tool call paired with its result by `tool_use_id`. */
 export interface ToolCall {
@@ -66,6 +91,12 @@ export interface CallAnswer {
   keepCall: number;
   /** Jev's probability that the full result is still needed; 0 when not asked. */
   keepResult: number;
+  /**
+   * `keepResult` is conditional on keeping the call (a `choice` answer), so a
+   * call below `keepCallThreshold` is never kept verbatim however high its
+   * conditional `keepResult` is.
+   */
+  nested?: true;
 }
 
 /**
@@ -90,6 +121,8 @@ export type CallReason =
 
 export interface CallDecision extends CallAnswer {
   id: string;
+  /** The call's own id in the transcript, to map a decision back onto a native history. */
+  tool_use_id?: string;
   tool: string;
   action: CallAction;
   reason: CallReason;
@@ -164,6 +197,14 @@ export interface CompactOptions {
   stubChars?: number;
   /** Cut machine-generated blocks (system reminders, task notifications, command echoes) in old user messages. Default true. */
   pruneMachineText?: boolean;
+  /**
+   * Whether a kept or stubbed call's input may be shortened. Turn it off for
+   * a host whose history cannot rewrite an assistant message (an append-only log, a provider
+   * that signs tool calls): only tool results then change, and
+   * `dropCalls: 'delete'` falls back to `stub`, since the call has to stay.
+   * Default true.
+   */
+  rewriteInputs?: boolean;
   /** Jev requests in flight at once. Default 4. */
   concurrency?: number;
   /**
@@ -207,6 +248,7 @@ export interface ResolvedCompactOptions {
   dropCalls: DropCalls;
   stubChars: number;
   pruneMachineText: boolean;
+  rewriteInputs: boolean;
   concurrency: number;
   arbitrateBand: number;
   primitive: 'noul' | 'choice';
@@ -232,15 +274,24 @@ export interface CompactStats {
   /** Estimated tokens of the largest request state. */
   stateTokens: number;
   requests: number;
-  /** Calls the arbiter was asked about, and how many of those changed action. */
+  /** Calls the arbiter was asked about, how many it answered, and how many of those changed action. */
   arbitrated: number;
+  arbiterAnswered: number;
   arbiterFlips: number;
+  /** Arbiter requests that failed; their calls kept the judge's answers. */
+  arbiterFailures: number;
   ms: number;
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
+  /**
+   * The same output aligned with the input: one entry per input message,
+   * `null` where a message lost all its content. Format adapters use it to
+   * map the result back onto a native history.
+   */
+  aligned: (Message | null)[];
   decisions: CallDecision[];
   stats: CompactStats;
 }

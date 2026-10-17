@@ -11,7 +11,7 @@ import type {
 import { claudeAsker, DEFAULT_CLAUDE_MODEL, forkAsker, type Completer, type Forker } from '../src/claude-asker.js';
 import { openaiAsker, OpenAIRequestError } from '../src/openai-asker.js';
 import { compact, prunableShare, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, retryAfterMs, withRetry, withTimeout } from '../src/request.js';
+import { buildJevRequest, DEFAULT_MODEL, parseJevResponse, retryAfterMs, withRetry, withTimeout, type Sleeper } from '../src/request.js';
 import type {
   CallDecision,
   CompactOptions,
@@ -190,7 +190,7 @@ export function jevAsker(
 }
 
 /** The same asker with every `ask` bounded to `ms`; a timed-out request fails the round like any other error. */
-export function timedAsker(asker: JevAsker, ms: number, sleep: ((ms: number) => Promise<void>) | undefined): JevAsker {
+export function timedAsker(asker: JevAsker, ms: number, sleep: Sleeper | undefined): JevAsker {
   if (!sleep || ms <= 0) return asker;
   return {
     ask: (state, questions, calls) =>
@@ -279,7 +279,7 @@ export type Judges = {
   fetch: HookFetch;
   complete?: Completer;
   fork?: Forker;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: Sleeper;
 };
 
 /** Builds the asker for the selected judge; throws when Jev is selected without a key. */
@@ -582,7 +582,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
         complete: (request) => $.model.complete(request),
         // The fork judge is only for the main conversation: a subagent's transcript is not the session's.
         fork: event.agentId === undefined ? (request) => $.model.fork(request) : undefined,
-        sleep: (ms) => $.clock.sleep(ms),
+        sleep: (ms: number, options?: { signal?: AbortSignal }) =>
+          $.clock.sleep(ms, options?.signal ? { signal: options.signal } : undefined),
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       const line = `${tag} [${backend}] kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(

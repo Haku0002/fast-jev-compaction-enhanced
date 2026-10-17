@@ -111,9 +111,41 @@ export function pruneMachineBlocks(text: string, headChars: number): string {
   );
 }
 
-/** The summary message Claude Code's own compaction leaves first in the history. */
+/**
+ * How the summaries hosts leave behind start: Claude Code's continuation
+ * summary, a `<compacted-summary>` checkpoint, Codex's hand-over
+ * prefix, and the common `<summary>` wrappers.
+ */
+const SUMMARY_STARTS = [
+  /^This session is being continued from a previous conversation/,
+  /^This is an automatically generated checkpoint condensing an earlier span/,
+  /^Another language model started to solve this problem and produced a summary/,
+  /^<(compacted-summary|conversation[-_]summary|summary)>/,
+];
+
+/**
+ * Whether a user text is a summary an earlier compaction left: never a
+ * prompt for the goal, and never cut as host text.
+ */
 export function isCompactSummary(text: string): boolean {
-  return text.trimStart().startsWith('This session is being continued from a previous conversation');
+  const start = text.trimStart();
+  return SUMMARY_STARTS.some((pattern) => pattern.test(start)) || start.includes('<compacted-summary>');
+}
+
+/**
+ * An old host message (a runtime-context snapshot, a reminder, a job notice)
+ * cut to its head and a note; a summary or a short text comes back as it is.
+ */
+export function cutHostText(text: string, headChars: number): string {
+  if (text.length <= headChars + 120 || isCompactSummary(text) || isTombstoneText(text)) return text;
+  const kept = sliceText(text, 0, headChars);
+  return `${kept}\n[fast-jev-compaction truncated ${text.length - kept.length} chars of this host message]`;
+}
+
+const HOST_TOMBSTONE = /\[fast-jev-compaction truncated \d+ chars of this host message\]\s*$/;
+
+function isTombstoneText(text: string): boolean {
+  return HOST_TOMBSTONE.test(text);
 }
 
 /** The note an earlier round leaves is always the last line of the result. */
@@ -148,22 +180,56 @@ export interface CallTarget {
  * command of a Bash, the pattern and path of a search. Undefined for a tool
  * with no such field.
  */
+/** Field names tools of different hosts and models use for the same thing. */
+const FILE_KEYS = ['file_path', 'filePath', 'notebook_path', 'target_file', 'absolute_path', 'filename', 'file', 'path'];
+const COMMAND_KEYS = ['command', 'cmd', 'script'];
+const SEARCH_KEYS = ['pattern', 'regex', 'query', 'q'];
+const RANGE_KEYS = ['offset', 'limit', 'start_line', 'end_line', 'line', 'startLine', 'endLine', 'view_range', 'range'];
+const CWD_KEYS = ['workdir', 'cwd', 'working_directory', 'workingDirectory', 'dir'];
+const SEARCH_FILTERS = ['glob', 'include', 'type', 'output_mode', 'case_sensitive', '-i', 'multiline', 'head_limit', 'context', '-A', '-B', '-C'];
+
+function firstString(input: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim().length > 0) return value;
+    // A command given as an argv array (Codex `shell`, some function schemas).
+    if (Array.isArray(value) && value.length > 0 && value.every((part) => typeof part === 'string')) {
+      return value.join(' ');
+    }
+  }
+  return undefined;
+}
+
+/** Windows and POSIX spellings of one path compare equal. */
+function normalisePath(path: string): string {
+  return path.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+}
+
 export function callTarget(tool: string, input: Record<string, unknown>): CallTarget | undefined {
-  const file = input['file_path'] ?? input['notebook_path'] ?? input['path'];
-  if (typeof file === 'string' && file.length > 0 && !('pattern' in input)) {
-    const offset = input['offset'];
-    const limit = input['limit'];
-    if (typeof offset === 'number' || typeof limit === 'number') {
-      return { key: `file:${file}@${offset ?? 0}+${limit ?? ''}`, file: `file:${file}` };
+  const search = firstString(input, SEARCH_KEYS);
+  const rawFile = firstString(input, FILE_KEYS);
+  if (rawFile !== undefined && search === undefined) {
+    const file = normalisePath(rawFile);
+    const range = RANGE_KEYS.filter((key) => input[key] !== undefined && input[key] !== null);
+    if (range.length > 0) {
+      const at = range.map((key) => `${key}=${JSON.stringify(input[key])}`).join(',');
+      return { key: `file:${file}@${at}`, file: `file:${file}` };
     }
     return { key: `file:${file}` };
   }
-  const command = input['command'] ?? input['cmd'];
-  if (typeof command === 'string' && command.length > 0) return { key: `${tool}:${command.trim()}` };
-  const pattern = input['pattern'];
-  if (typeof pattern === 'string' && pattern.length > 0) {
-    return { key: `${tool}:${pattern}:${typeof input['path'] === 'string' ? input['path'] : ''}` };
+  const command = firstString(input, COMMAND_KEYS);
+  if (command !== undefined) {
+    // The same command in another directory is another command.
+    const cwd = firstString(input, CWD_KEYS);
+    return { key: `${tool}:${command.trim().replace(/\s+/g, ' ')}${cwd ? `@${normalisePath(cwd)}` : ''}` };
   }
+  if (search !== undefined) {
+    // Every filter narrows the search: a different glob or mode is a different search.
+    const filters = SEARCH_FILTERS.filter((key) => input[key] !== undefined).map((key) => `${key}=${JSON.stringify(input[key])}`);
+    return { key: `${tool}:${search}:${rawFile === undefined ? '' : normalisePath(rawFile)}:${filters.join(',')}` };
+  }
+  const url = input['url'];
+  if (typeof url === 'string' && url.length > 0) return { key: `${tool}:${url.trim()}` };
   return undefined;
 }
 
@@ -177,11 +243,17 @@ export function collectToolCalls(
   preserveRecentMessages: number,
 ): ToolCall[] {
   const results = new Map<string, { index: number; result: ToolResult }>();
+  // An id used by more than one call or result cannot be mapped back safely: such calls are pinned.
+  const callCount = new Map<string, number>();
+  const resultCount = new Map<string, number>();
   messages.forEach((message, index) => {
+    for (const tool of message.toolUses) callCount.set(tool.tool_use_id, (callCount.get(tool.tool_use_id) ?? 0) + 1);
     for (const result of message.toolResults ?? []) {
-      results.set(result.tool_use_id, { index, result });
+      resultCount.set(result.tool_use_id, (resultCount.get(result.tool_use_id) ?? 0) + 1);
+      if (!results.has(result.tool_use_id)) results.set(result.tool_use_id, { index, result });
     }
   });
+  const ambiguous = (id: string): boolean => (callCount.get(id) ?? 0) > 1 || (resultCount.get(id) ?? 0) > 1;
   const calls: ToolCall[] = [];
   messages.forEach((message, callIndex) => {
     for (const tool of message.toolUses) {
@@ -202,6 +274,9 @@ export function collectToolCalls(
         isError: found.result.isError ?? false,
         tombstone: isTombstone(text),
         pinned:
+          found.result.pinned === true ||
+          ambiguous(tool.tool_use_id) ||
+          found.index < callIndex ||
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
           isPinned(found.index, messages.length, preserveRecentMessages),
       });
@@ -210,18 +285,31 @@ export function collectToolCalls(
   // Walked newest first: a call is superseded by the next later call on the
   // same key, or, for a call about part of a file, by the next later call on
   // the whole file (an Edit, a Write, a Read without a range).
+  // A change to a file (an Edit, a Write) is superseded only by a later change to it: a later
+  // read shows the new contents, but not that this edit was the one that made them.
   const nextOnKey = new Map<string, number>();
+  const nextChangeOnKey = new Map<string, number>();
   for (let i = calls.length - 1; i >= 0; i -= 1) {
     const call = calls[i]!;
     const target = callTarget(call.tool, call.input);
     if (!target) continue;
-    const candidates = [nextOnKey.get(target.key), target.file ? nextOnKey.get(target.file) : undefined].filter(
-      (index): index is number => index !== undefined,
-    );
+    const changes = isChange(call.tool, call.input);
+    const index = changes ? nextChangeOnKey : nextOnKey;
+    const keys = [target.key, ...(target.file ? [target.file] : [])];
+    const candidates = keys.map((key) => index.get(key)).filter((at): at is number => at !== undefined);
     if (candidates.length > 0) call.supersededBy = calls[Math.min(...candidates)]!.id;
     nextOnKey.set(target.key, i);
+    if (changes) nextChangeOnKey.set(target.key, i);
   }
   return calls;
+}
+
+const CHANGE_FIELDS = ['old_string', 'new_string', 'content', 'contents', 'patch', 'diff', 'edits', 'insert_line', 'new_str', 'old_str'];
+const CHANGE_TOOL = /(^|[_\W])(edit|write|patch|replace|create|insert|apply|delete|remove|move|rename)/i;
+
+/** Whether a call changes its target rather than reading it. */
+export function isChange(tool: string, input: Record<string, unknown>): boolean {
+  return CHANGE_TOOL.test(tool) || CHANGE_FIELDS.some((field) => field in input);
 }
 
 function inputText(input: Record<string, unknown>, limit: number): string {
@@ -288,12 +376,17 @@ function callsByMessage(calls: readonly ToolCall[]): Map<number, ToolCall[]> {
   return byMessage;
 }
 
+/** One-line notices hosts write into the user side (Claude Code's interruption marker, say). */
+const HOST_NOTICE = /^\[Request interrupted by user[^\]]*\]\s*$/gm;
+
 /** The last three human prompts, as the default `goal`; host blocks and summaries are not prompts. */
 export function goalFromMessages(messages: readonly Message[]): string {
   const prompts: string[] = [];
   for (const message of messages) {
-    if (message.role !== 'user' || (message.toolResults ?? []).length > 0) continue;
-    const text = message.text.replace(MACHINE_BLOCK, '').trim();
+    // A person who interrupts or redirects a tool types into the same message as its result,
+    // so a message holding results still counts when it also holds the person's words.
+    if (message.role !== 'user' || (message.author ?? 'person') !== 'person') continue;
+    const text = message.text.replace(MACHINE_BLOCK, '').replace(HOST_NOTICE, '').trim();
     if (text.length === 0 || isCompactSummary(text)) continue;
     prompts.push(truncate(text, 500));
   }

@@ -55,7 +55,9 @@ export function retryAfterMs(headers: Record<string, string> | undefined, now = 
   const key = Object.keys(headers).find((name) => name.toLowerCase() === 'retry-after');
   const value = key === undefined ? undefined : headers[key]?.trim();
   if (!value) return undefined;
-  if (/^\d+$/.test(value)) return Number(value) * 1000;
+  // Delay-seconds; a fractional value is not standard, but some servers send one.
+  if (/^\d+(\.\d+)?$/.test(value)) return Math.round(Number(value) * 1000);
+  if (/^[\d.\s+-]+$/.test(value)) return undefined;
   const at = Date.parse(value);
   return Number.isFinite(at) ? Math.max(0, at - now) : undefined;
 }
@@ -98,16 +100,11 @@ export function noulAnswer(
   answers: Record<string, JevAnswer>,
   name: string,
 ): number | undefined {
-  const answer = answers[name];
-  if (
-    !answer ||
-    !('noul' in answer) ||
-    typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1
-  ) {
-    return undefined;
-  }
-  return answer.noul;
+  const answer: unknown = answers[name];
+  // A custom asker may hand back a bare probability instead of `{ noul }`.
+  const value = typeof answer === 'number' ? answer : answer !== null && typeof answer === 'object' ? (answer as { noul?: unknown }).noul : undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) return undefined;
+  return value;
 }
 
 /**
@@ -125,19 +122,22 @@ export function noulAnswer(
 export function choiceAnswer(
   answers: Record<string, JevAnswer>,
   name: string,
-): { keepCall: number; keepResult: number } | undefined {
-  const answer = answers[name];
-  if (!answer || !('probabilities' in answer) || answer.probabilities === null) return undefined;
-  const p = answer.probabilities as Record<string, unknown>;
+): { keepCall: number; keepResult: number; nested: true } | undefined {
+  const answer: unknown = answers[name];
+  if (answer === null || typeof answer !== 'object') return undefined;
+  const p = (answer as { probabilities?: unknown }).probabilities;
+  if (p === null || typeof p !== 'object' || Array.isArray(p)) return undefined;
+  const probabilities = p as Record<string, unknown>;
   const at = (key: string): number => {
-    const value = p[key];
+    const value = probabilities[key];
     return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
   };
-  if (!('stub' in p)) return undefined;
+  if (!('stub' in probabilities)) return undefined;
   const keepCall = Math.min(1, Math.max(0, 1 - at('stub')));
-  if (!('keep_result' in p)) return { keepCall, keepResult: 0 };
+  if (!('keep_result' in probabilities)) return { keepCall, keepResult: 0, nested: true };
   const keepResult = keepCall > 0 ? Math.min(1, at('keep_result') / keepCall) : 0;
-  return { keepCall, keepResult };
+  // `keepResult` is conditional on keeping the call, so the call threshold is checked first.
+  return { keepCall, keepResult, nested: true };
 }
 
 /** Failures worth one more try: rate limits, server errors, a dropped connection, a timeout. */
@@ -147,10 +147,31 @@ export function isRetryable(error: unknown): boolean {
   return RETRYABLE.test(error instanceof Error ? error.message : String(error));
 }
 
-/** A pause on the host timer, or none where the module has no timer. */
-function defaultSleep(ms: number): Promise<void> {
-  const timer = (globalThis as { setTimeout?: (fn: () => void, ms: number) => unknown }).setTimeout;
-  return new Promise<void>((resolve) => (timer ? timer(resolve, ms) : resolve()));
+/** A pause on the host timer, cancelled by `signal`; none where the module has no timer. */
+export function defaultSleep(ms: number, options: { signal?: AbortSignal } = {}): Promise<void> {
+  const g = globalThis as {
+    setTimeout?: (fn: () => void, ms: number) => unknown;
+    clearTimeout?: (handle: unknown) => void;
+  };
+  return new Promise<void>((resolve, reject) => {
+    if (!g.setTimeout) {
+      resolve();
+      return;
+    }
+    if (options.signal?.aborted) {
+      reject(new Error('sleep aborted'));
+      return;
+    }
+    const handle = g.setTimeout(() => {
+      options.signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort(): void {
+      g.clearTimeout?.(handle);
+      reject(new Error('sleep aborted'));
+    }
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /**
@@ -186,24 +207,44 @@ export async function withRetry<T>(
 }
 
 /**
+ * A pause the caller can cancel. Hosts pass their own timer (Claude Code's
+ * `$.clock.sleep(ms, { signal })`); a sleeper that ignores the signal still
+ * works, it just keeps its timer until it fires.
+ */
+export type Sleeper = (ms: number, options?: { signal?: AbortSignal }) => Promise<void>;
+
+/**
  * Rejects with `<what> timed out after <ms> ms` when `promise` has not
  * settled by then. The pending work is not cancelled (a fetch has no handle
- * here); the caller just stops waiting for it. No timeout without a sleeper.
+ * here); the caller just stops waiting for it. The timer is cancelled as
+ * soon as the promise settles. No timeout without a sleeper.
  */
 export function withTimeout<T>(
   promise: Promise<T>,
   ms: number,
-  sleep: ((ms: number) => Promise<void>) | undefined,
+  sleep: Sleeper | undefined,
   what = 'request',
 ): Promise<T> {
   if (!sleep || !(ms > 0)) return promise;
   let done = false;
+  const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
   const timer = new Promise<never>((_, reject) => {
-    void sleep(ms).then(() => {
-      if (!done) reject(new Error(`${what} timed out after ${ms} ms`));
-    });
+    // A sleeper that rejects (an aborted or cancelled timer) must not surface as an unhandled rejection.
+    let pending: Promise<void>;
+    try {
+      pending = controller ? sleep(ms, { signal: controller.signal }) : sleep(ms);
+    } catch {
+      return;
+    }
+    void Promise.resolve(pending).then(
+      () => {
+        if (!done) reject(new Error(`${what} timed out after ${ms} ms`));
+      },
+      () => undefined,
+    );
   });
   return Promise.race<T>([promise, timer]).finally(() => {
     done = true;
+    controller?.abort();
   });
 }

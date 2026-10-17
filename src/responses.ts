@@ -6,7 +6,7 @@ export interface ResponsesItem { [key: string]: unknown }
 
 export interface ProtectedCall { callId: string; reason: string }
 
-export interface ResponsesCompaction extends Omit<CompactResult, 'messages'> {
+export interface ResponsesCompaction extends Omit<CompactResult, 'messages' | 'aligned'> {
   input: ResponsesItem[];
   itemsBefore: number;
   itemsAfter: number;
@@ -124,13 +124,13 @@ export async function compactResponsesInput(
 ): Promise<ResponsesCompaction> {
   const { messages, pairs, protectedCalls } = project(input);
   const result = await compact(messages, asker, { ...options, pruneMachineText: false });
-  const decisions = new Map(result.decisions.map((decision) => [decision.id, decision]));
+  // Keyed by the native call id, so the mapping never depends on how the core numbers its calls.
+  const decisions = new Map(result.decisions.map((decision) => [decision.tool_use_id ?? decision.id, decision]));
   const tools = new Map(result.messages.flatMap((message) => message.toolUses.map((tool) => [tool.tool_use_id, tool] as const)));
   const outputs = new Map(result.messages.flatMap((message) => (message.toolResults ?? []).map((output) => [output.tool_use_id, output] as const)));
   const replacements = new Map<number, ResponsesItem | null>();
-  // Core short ids enumerate these eligible pairs in call order.
-  pairs.forEach((pair, index) => {
-    const decision = decisions.get(`t${index + 1}`);
+  pairs.forEach((pair) => {
+    const decision = decisions.get(pair.id);
     if (!decision || decision.action === 'keep') return;
     const original = input[pair.callIndex]!;
     const originalOutput = input[pair.resultIndex]!;
