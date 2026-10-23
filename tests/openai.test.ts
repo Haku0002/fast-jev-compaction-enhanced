@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildOpenAIJudgeRequest, compact, JevClient, noulAnswer, OpenAIClient, openaiAsker, parseOpenAIJudgeResponse,
+  buildOpenAIJudgeRequest, chatAsker, compact, JevClient, JevRequestError, noulAnswer, OpenAIClient, openaiAsker,
+  parseOpenAIJudgeResponse, parseJevResponse,
   type JevQuestions, type Message, type OpenAIJudgeRequest,
 } from '../src/index.js';
 
@@ -114,6 +115,42 @@ describe('OpenAI HTTP transport', () => {
     await vi.advanceTimersByTimeAsync(10);
     await pending;
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not retry a client-imposed OpenAI timeout and requires HTTPS remotely', async () => {
+    let attempts = 0;
+    const client = new OpenAIClient({ model: 'm', apiKey: 'test-key', timeoutMs: 15,
+      fetch: async (_url, init) => {
+        attempts += 1;
+        return new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('aborted'))));
+      },
+    });
+    await expect(client.ask({}, questions)).rejects.toThrow(/timed out after 15/);
+    expect(attempts).toBe(1);
+    expect(() => chatAsker({ model: 'm', baseUrl: 'http://remote.example/v1' })).toThrow(/HTTPS/);
+    expect(() => chatAsker({ model: 'm', baseUrl: 'https://api.example/v1?x=1' })).toThrow(/query/);
+  });
+
+  it('does not retry a client-imposed Chat timeout or include a Jev error body in the Error', async () => {
+    let attempts = 0;
+    const asker = chatAsker({ model: 'm', baseUrl: 'http://localhost:1234/v1', timeoutMs: 15,
+      fetch: async (_url, init) => {
+        attempts += 1;
+        return new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('aborted'))));
+      },
+    });
+    await expect(asker.ask({}, questions)).rejects.toThrow(/timed out after 15/);
+    expect(attempts).toBe(1);
+
+    const marker = 'PRIVATE_TRANSCRIPT_MARKER';
+    try {
+      parseJevResponse(500, false, `provider echoed ${marker}`);
+      throw new Error('expected parseJevResponse to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(JevRequestError);
+      expect((error as Error).message).toBe('Jev request failed (500)');
+      expect((error as Error).message).not.toContain(marker);
+    }
   });
 
   it('also bounds the default Jev library transport and treats invalid probabilities as unscored', async () => {

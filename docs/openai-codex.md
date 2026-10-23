@@ -1,5 +1,12 @@
 # OpenAI and Codex integration
 
+> **Historical design note.** This records the 0.6.0 to 0.7.0 work that brought
+> the OpenAI Responses judge in. Since then the core became host-neutral
+> (0.8.0, `multi-format` branch): the same judge also serves any Chat
+> Completions endpoint, and every history format has an adapter. The
+> constraints recorded below (no replacement history from Codex hooks, an
+> explicit model, no silently substituted keys) still hold.
+
 This work starts from `e2bdf63` (0.6.0). Upstream `tamaratran/main` is
 `e3f262a` and is already an ancestor. Its open PRs are proposals, not releases.
 `Haku0002/fast-jev-compaction-enhanced` has the same `e2bdf63` tip. Work continues locally

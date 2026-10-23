@@ -1,6 +1,6 @@
 import { buildClaudePrompt, CLAUDE_JUDGE_SYSTEM, replyText } from './claude-asker.js';
 import { parseJudgeReply } from './judge-reply.js';
-import { retryAfterMs, withRetry } from './request.js';
+import { isRetryable, RequestTimeoutError, retryAfterMs, withRetry } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
 /**
@@ -108,8 +108,11 @@ export function chatReplyText(reply: unknown): string {
 export function chatAsker(options: ChatAskerOptions): JevAsker {
   if (!options.model?.trim()) throw new Error('Chat judge requires an explicit model');
   const root = new URL(options.baseUrl);
-  if (!['http:', 'https:'].includes(root.protocol) || root.username || root.password || root.hash) {
-    throw new Error('baseUrl must be an HTTP(S) API root without credentials or fragment');
+  if (!['http:', 'https:'].includes(root.protocol) || root.username || root.password || root.search || root.hash) {
+    throw new Error('baseUrl must be an HTTP(S) API root without credentials, query or fragment');
+  }
+  if (root.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(root.hostname)) {
+    throw new Error('Remote Chat judge endpoints require HTTPS');
   }
   const endpoint = /\/chat\/completions\/?$/.test(root.pathname)
     ? root.href
@@ -147,7 +150,7 @@ export function chatAsker(options: ChatAskerOptions): JevAsker {
         throw new Error('Chat judge endpoint returned malformed JSON');
       }
     } catch (error) {
-      if (controller.signal.aborted) throw new Error(`Chat judge request timed out after ${timeoutMs} ms`);
+      if (controller.signal.aborted) throw new RequestTimeoutError(`Chat judge request timed out after ${timeoutMs} ms`);
       throw error;
     } finally {
       clearTimeout(timer);
@@ -161,6 +164,8 @@ export function chatAsker(options: ChatAskerOptions): JevAsker {
         return await withRetry(() => post(buildChatJudgeBody(state, questions, options, attempt)), {
           retries: options.retries,
           sleep: options.sleep,
+          // Retrying this client's own deadline only repeats the same slow wait.
+          shouldRetry: (error) => !(error instanceof RequestTimeoutError) && isRetryable(error),
         });
       } catch (error) {
         const rejected = error instanceof ChatRequestError && (error.status === 400 || error.status === 422);

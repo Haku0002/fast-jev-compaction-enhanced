@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
@@ -22,6 +22,35 @@ export interface CodexAskerOptions {
  * Runs in an empty ephemeral directory, requests JSON only, and rejects a turn
  * that uses tools. It does not read OAuth tokens or rewrite a running thread.
  */
+/**
+ * Terminates a judge process and any processes it started. A native CLI may
+ * delegate inference to helper processes; killing only the direct child can
+ * leave those helpers consuming CPU and network after the judge has timed out.
+ */
+export function killProcessTree(child: ChildProcess): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.pid === undefined) {
+    child.kill();
+    return;
+  }
+  if (process.platform === 'win32') {
+    try {
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+      killer.once('error', () => child.kill());
+      killer.unref();
+    } catch {
+      child.kill();
+    }
+    return;
+  }
+  try {
+    // The judge is spawned detached on POSIX so its negative PID names only its own group.
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    child.kill('SIGKILL');
+  }
+}
+
 export function codexAsker(options: CodexAskerOptions): JevAsker {
   if (!options.executable?.trim()) throw new Error('Codex judge requires a native executable');
   if (!options.model?.trim() || options.model.startsWith('-')) throw new Error('Codex judge requires an explicit model');
@@ -52,12 +81,15 @@ async function complete(request: OpenAIJudgeRequest, options: CodexAskerOptions,
         env: { ...process.env, OPENAI_API_KEY: '', TYPESAFE_API_KEY: '', RUST_LOG: 'error',
           ...(options.proxy ? { HTTP_PROXY: options.proxy, HTTPS_PROXY: options.proxy } : {}) },
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Give the POSIX child its own process group so timeout cleanup can kill the tree.
+        detached: process.platform !== 'win32',
+        windowsHide: true,
       });
       let buffer = '', tokens: Record<string, unknown> | undefined;
       let failed = false, completed = false, settled = false;
       const fail = (error: Error): void => {
         if (settled) return;
-        settled = true; clearTimeout(timer); child.kill(); reject(error);
+        settled = true; clearTimeout(timer); killProcessTree(child); reject(error);
       };
       const timer = setTimeout(() => fail(new Error(`Codex judge timed out after ${timeoutMs} ms`)), timeoutMs);
       child.stdout.on('data', (chunk: Buffer) => {

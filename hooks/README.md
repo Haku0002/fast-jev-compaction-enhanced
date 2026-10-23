@@ -1,6 +1,7 @@
 # fast-jev-compaction Claude Code mod
 
-This plugin uses Claude Code function hooks to replace a compaction with the
+This plugin is a Claude Code mod (a plugin with a hooks module). It uses
+hooks to replace a compaction with the
 original messages, minus the tool traffic a judge says is no longer needed.
 `hooks/fast-jev.ts` is a thin adapter: it reads the plugin options, picks the
 judge, hands `session.compact` transcripts to the `fast-jev-compaction`
@@ -132,21 +133,21 @@ they do.
 
 ## Install
 
-Function hooks are an early-access Claude Code feature (2.1.274+). Enable
-them before installing or loading the module:
+Mods are a standard Claude Code feature (2.1.287 or later); no opt-in flag is
+needed. Set the TypeSafe key in the environment or in the plugin options:
 
 ```sh
-export CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1
 export TYPESAFE_API_KEY="<your TypeSafe key>"   # optional: without it the Claude judge is used
 
-claude plugin marketplace add tamaratran/fast-jev-compaction
+claude plugin marketplace add Haku0002/fast-jev-compaction-enhanced
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
 For local development:
 
 ```sh
-CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .
+claude --plugin-dir .
+claude plugin validate .
 ```
 
 An installed plugin is a copy taken at install time, not the source
@@ -161,13 +162,23 @@ for the desktop app): that folder is watched, and a save reloads the module.
 
 ## Scope and caveat
 
-Function hooks are early access and may change between Claude Code releases.
-This mod uses the generated declarations from 2.1.274 in
-`types/claude-code.d.ts`; regenerate and review that file after a
-Claude Code upgrade.
+A mod's events and return shapes are part of the Claude Code build it runs in
+and can change between releases. This mod is checked against the declarations
+in `types/claude-code.d.ts`. When Claude Code loads a mod from `--plugin-dir`
+it writes the declarations for your build under `.claude-plugin/types/`; those
+win over this file and over any documentation page when they disagree. Review
+and regenerate the vendored file after a Claude Code upgrade, and run
+`claude plugin validate .` so the hooks and mods API calls Claude Code finds
+in the module are the ones you meant.
+
+In particular, `session.compact` accepts replacement messages only on builds
+whose declarations say so. Where it does not, the built-in summary remains the
+compaction that runs, and a round with too little to prune is still vetoed
+with `{ skip }`, which every build accepts.
 
 References:
 
 - [Claude Code plugins](https://code.claude.com/docs/en/plugins)
-- [Claude Code plugins reference](https://code.claude.com/docs/en/plugins-reference)
+- [Create a mod](https://code.claude.com/docs/en/plugins/mods/create)
+- [Mods reference](https://code.claude.com/docs/en/plugins/mods/reference)
 - [Claude Code hooks](https://code.claude.com/docs/en/hooks)

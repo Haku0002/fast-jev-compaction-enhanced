@@ -1,5 +1,5 @@
 import { openaiAsker, OpenAIRequestError, type OpenAIAskerOptions, type OpenAIJudgeRequest } from './openai-asker.js';
-import { retryAfterMs, withRetry } from './request.js';
+import { isRetryable, RequestTimeoutError, retryAfterMs, withRetry } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
 export interface OpenAIClientOptions extends OpenAIAskerOptions {
@@ -63,12 +63,16 @@ export class OpenAIClient implements JevAsker {
         const text = await response.text();
         try { return JSON.parse(text) as unknown; } catch { throw new Error('OpenAI endpoint returned malformed JSON'); }
       } catch (error) {
-        if (controller.signal.aborted) throw new Error(`OpenAI judge request timed out after ${this.timeoutMs} ms`);
+        if (controller.signal.aborted) throw new RequestTimeoutError(`OpenAI judge request timed out after ${this.timeoutMs} ms`);
         throw error;
       } finally {
         clearTimeout(timer);
       }
-    }, { retries: this.options.retries });
+    }, {
+      retries: this.options.retries,
+      // Retrying this client's own deadline only repeats the same slow wait.
+      shouldRetry: (error) => !(error instanceof RequestTimeoutError) && isRetryable(error),
+    });
   }
 
   ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
