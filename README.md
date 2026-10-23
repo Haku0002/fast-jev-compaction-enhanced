@@ -327,28 +327,33 @@ of the input), enough to audit a round after the fact.
 
 ## Claude Code plugin
 
-The repository root is a Claude Code function-hook plugin: `hooks/fast-jev.ts`
-is a thin adapter that feeds `session.compact` transcripts through `src/`,
-scored by Jev when `TYPESAFE_API_KEY` is set and otherwise by Claude (Haiku
-by default) through the session's own API client, or by a fork of the
-session itself (`backend: fork`), and falls back to Claude Code's built-in
-summary on errors or after `timeoutMs`. See [`hooks/README.md`](hooks/README.md) for configuration and the
-Claude Code 2.1.274 type reference.
+The repository root is a Claude Code mod (a plugin with a hooks module):
+`hooks/fast-jev.ts` is a thin adapter that feeds `session.compact` transcripts
+through `src/`, scored by Jev when `TYPESAFE_API_KEY` is set and otherwise by
+Claude (Haiku by default) through the session's own API client, or by a fork of
+the session itself (`backend: fork`), and falls back to Claude Code's built-in
+summary on errors or after `timeoutMs`. See [`hooks/README.md`](hooks/README.md) for configuration.
+
+A mod's events and return shapes are part of the build it runs in, and they
+have changed since this adapter was first written. `types/claude-code.d.ts`
+holds the declarations it is checked against; when Claude Code loads a mod
+from `--plugin-dir` it writes the declarations for your build under
+`.claude-plugin/types/`, and those win over this file and over any
+documentation page when they disagree. Run `claude plugin validate .` before
+relying on a new Claude Code release.
 
 ### Install in Claude Code
 
-Function hooks are an early-access Claude Code feature (2.1.274+), so the
-opt-in flag must be set wherever Claude Code runs, e.g. in `~/.claude/settings.json`:
-
-```json
-{ "env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1", "TYPESAFE_API_KEY": "<your key>" } }
-```
+Mods are a standard Claude Code feature (2.1.287 or later); no opt-in flag is
+needed. Set `TYPESAFE_API_KEY` in the environment, in the `env` block of
+`~/.claude/settings.json`, or as the plugin's `apiKey` option; without it the
+session's own model scores instead.
 
 Then add this repository as a plugin marketplace and install the plugin,
 either from the shell or as slash commands inside a session:
 
 ```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
+claude plugin marketplace add Haku0002/fast-jev-compaction-enhanced
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
@@ -363,9 +368,9 @@ is tool traffic to be worth a round, or `fallback to built-in summary (…)`
 when the judge fails. Every outcome is also appended to
 `~/.claude/fast-jev-compaction.log`.
 
-To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
-from the repository root. No publishing step is required; the marketplace is
-just the repo's `.claude-plugin/marketplace.json`.
+To run from a checkout without installing: `claude --plugin-dir .` from the
+repository root. No publishing step is required; the marketplace is just the
+repo's `.claude-plugin/marketplace.json`.
 
 ## Development
 

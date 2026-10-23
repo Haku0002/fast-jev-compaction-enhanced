@@ -114,6 +114,23 @@ function resolveDropCalls(value: string | undefined): DropCalls | undefined {
   return value === 'stub' || value === 'delete' ? value : undefined;
 }
 
+/**
+ * What to do when too little of the history is worth scoring:
+ * - `summary`: hand it to the built-in summary (`next`), for automatic compaction,
+ *   or when the user asked for summaries;
+ * - `keep`: keep the computed result, for a `precompute` whose kept messages are
+ *   the input of the compaction that comes;
+ * - `skip`: veto the compaction. A skip reads the same on every Claude Code
+ *   build, unlike a fabricated "compacted to itself" result.
+ */
+export function nothingToPruneOutcome(
+  trigger: string,
+  preference: NothingToPrune,
+): 'summary' | 'keep' | 'skip' {
+  if (trigger === 'auto' || preference === 'summary') return 'summary';
+  return trigger === 'precompute' ? 'keep' : 'skip';
+}
+
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
 export function resolveHookConfig(options: PluginOptions): HookConfig {
   const numbers: Partial<Omit<CompactOptions, 'goal' | 'dropCalls' | 'pruneMachineText'>> = {};
@@ -565,14 +582,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const line = `${tag} ${percent(share)} of the history is prunable (below ${percent(
           config.minReductionRatio,
         )} minimum)`;
-        if (event.trigger === 'auto' || config.nothingToPrune === 'summary') {
+        const outcome = nothingToPruneOutcome(event.trigger, config.nothingToPrune);
+        if (outcome === 'summary') {
           notify($, `${line}; built-in summary`, quiet);
           await record($, `${line}; built-in summary`);
           return next(event);
         }
         notify($, `${line}; history left unchanged`, quiet);
         await record($, `${line}; history left unchanged`);
-        return { messages: event.messages };
+        return outcome === 'keep' ? { messages: event.messages } : { skip: line };
       }
       const { result, messages } = await compactSession(event.messages, config, {
         fetch: async (url, init) => {

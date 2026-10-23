@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 const runner = vi.hoisted(() => vi.fn());
 vi.mock('node:child_process', () => ({ spawn: runner }));
-import { codexAsker, type JevQuestions } from '../src/index.js';
+import { codexAsker, killProcessTree, type JevQuestions } from '../src/index.js';
 
 const questions: JevQuestions = { call_t1: { type: 'noul', instructions: 'The call still matters' } };
 
@@ -53,6 +53,19 @@ describe('Codex login judge/arbiter', () => {
   it('rejects a judge that attempts tools instead of accepting its response', async () => {
     runner.mockImplementation(() => childFixture('tool'));
     await expect(codexAsker({ executable: 'native-codex', model: 'chosen-model' }).ask({}, questions)).rejects.toThrow(/attempted a tool call/);
+  });
+
+  it('terminates the process tree rather than only the direct child', () => {
+    const child = Object.assign(new EventEmitter(), { pid: 4242, exitCode: null, signalCode: null, kill: vi.fn(() => true) });
+    if (process.platform === 'win32') {
+      runner.mockImplementationOnce(() => Object.assign(new EventEmitter(), { unref: vi.fn() }));
+    }
+    killProcessTree(child as never);
+    if (process.platform === 'win32') {
+      expect(runner).toHaveBeenCalledWith('taskkill', ['/PID', '4242', '/T', '/F'], expect.objectContaining({ windowsHide: true }));
+    } else {
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    }
   });
 
   it('fails without a completed turn and validates proxy/model configuration before starting', async () => {

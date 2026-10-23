@@ -1,5 +1,11 @@
 # Local validation, 2026-10-07
 
+> **Historical record, not current state.** This describes the 0.7.0 candidate
+> on the `openai-codex` branch. The library has since become host-neutral on
+> the `multi-format` branch (0.8.0), which superseded that layout. Kept as
+> evidence of what was checked at the time; do not read the version, branch or
+> test counts below as current.
+
 Working branch: `openai-codex`, based on `e2bdf63` from
 `Haku0002/fast-jev-compaction-enhanced`. Local feature version: 0.7.0.
 Candidate checks were completed before publication and client installation.

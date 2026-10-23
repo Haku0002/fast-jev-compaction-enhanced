@@ -41,11 +41,14 @@ export class JevRequestError extends Error {
   /** From a `Retry-After` header, in milliseconds; undefined when the server gave none. */
   readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, body: string, retryAfterMs?: number) {
-    super(`Jev request failed (${status}): ${body.slice(0, 200)}`);
+  constructor(status: number, _body?: string, retryAfterMs?: number) {
+    // A provider error body may echo transcript text or a credential-shaped fragment,
+    // so it is never copied into an Error that a host may write to a durable log.
+    super(`Jev request failed (${status})`);
     this.name = 'JevRequestError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    void _body;
   }
 }
 

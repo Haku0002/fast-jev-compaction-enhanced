@@ -1,3 +1,4 @@
 {
+  "description": "fast-jev-compaction hooks module: scored tool-call compaction for Claude Code",
   "modules": ["./fast-jev.ts"]
 }

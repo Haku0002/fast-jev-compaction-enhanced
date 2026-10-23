@@ -6,6 +6,7 @@ import {
   decisionLogLines,
   probabilityProfile,
   libraryOptions,
+  nothingToPruneOutcome,
   pickArbiter,
   resolveHookConfig,
   selectBackend,
@@ -111,6 +112,14 @@ describe('hook config', () => {
     expect(resolveHookConfig({ arbiterModel: '' }).arbiterModel).toBe('');
     expect(resolveHookConfig({ arbitrateBand: 0.2 }).arbitrateBand).toBe(0.2);
     expect('dropCalls' in resolveHookConfig({ dropCalls: 'bogus' })).toBe(false);
+  });
+
+  it('maps a nothing-to-prune compaction to a result every build accepts', () => {
+    expect(nothingToPruneOutcome('auto', 'keep')).toBe('summary');
+    expect(nothingToPruneOutcome('manual', 'summary')).toBe('summary');
+    expect(nothingToPruneOutcome('precompute', 'keep')).toBe('keep');
+    expect(nothingToPruneOutcome('manual', 'keep')).toBe('skip');
+    expect(nothingToPruneOutcome('plugin', 'keep')).toBe('skip');
   });
 
   it('selects jev only when a key is available in auto mode, and widens the Claude judge', () => {
