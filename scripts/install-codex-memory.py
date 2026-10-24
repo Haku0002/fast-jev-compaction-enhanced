@@ -34,7 +34,7 @@ def main():
     installed = subprocess.run(command, capture_output=True, text=True)
     if installed.returncode:
         raise RuntimeError('Runtime dependency installation failed; pip diagnostics were not copied into project files')
-    server_dir = home/'server'/'0.7.0'
+    server_dir = home/'server'/'0.8.3'
     server_dir.mkdir(parents=True, exist_ok=True)
     for name in ['shelf.py', 'efficient.py', 'server.py']:
         shutil.copy2(ROOT/'retrieval'/'memory-shelf'/name, server_dir/name)
@@ -69,7 +69,7 @@ def main():
         (home/'approved-public-snapshots.json').write_text(json.dumps(approved, indent=2)+'\n', encoding='utf-8')
     if args.enable_jev and not (home/'approved-public-snapshots.json').exists():
         raise RuntimeError('Jev requires an explicit approved snapshot manifest')
-    config = {'version': '0.7.0', 'python': str(interpreter), 'server_dir': str(server_dir),
+    config = {'version': '0.8.3', 'python': str(interpreter), 'server_dir': str(server_dir),
               'enable_jev': args.enable_jev, 'proxy': args.proxy}
     (home/'runtime.json').write_text(json.dumps(config, indent=2)+'\n', encoding='utf-8')
     print(json.dumps({'runtime_home': str(home), 'version': config['version'], 'jev_enabled': args.enable_jev,
