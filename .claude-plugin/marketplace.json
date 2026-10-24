@@ -9,8 +9,11 @@
       "name": "fast-jev-compaction",
       "source": "./",
       "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself.",
-      "version": "0.8.2",
+      "version": "0.8.3",
       "license": "MIT"
     }
-  ]
+  ],
+  "metadata": {
+    "description": "Scored tool-call compaction: keeps the calls that still matter and stubs the rest, instead of a lossy prose summary."
+  }
 }
