@@ -318,7 +318,7 @@ describe('audit fixes', () => {
     const flaky: JevAsker = { async ask() { throw new Error('arbiter timed out'); } };
     const out = await compact(base(), judge, { preserveRecentMessages: 1, arbiter: flaky });
     expect(out.decisions[0]!.action).toBe('stub_call');
-    expect(out.stats).toMatchObject({ arbitrated: 1, arbiterAnswered: 0, arbiterFailures: 1 });
+    expect(out.stats).toMatchObject({ arbiterReviewed: 1, arbiterAnswered: 0, arbiterFailures: 1 });
   });
 
   it('reads a chat judge that answers a choice question with a probability, and a bare-number answer', async () => {
@@ -425,7 +425,7 @@ describe('audit fixes', () => {
     const judge: JevAsker = { async ask(_s, q) { return { answers: Object.fromEntries(Object.keys(q).map((k) => [k, { noul: k === 'call_t1' ? 0.45 : 0.05 }])) }; } };
     const silent: JevAsker = { async ask(_s, q) { return { answers: {}, unscored: Object.keys(q) }; } };
     const out = await compact(base(), judge, { preserveRecentMessages: 1, arbiter: silent });
-    expect(out.stats).toMatchObject({ arbitrated: 1, arbiterAnswered: 0, arbiterFailures: 0 });
+    expect(out.stats).toMatchObject({ arbiterReviewed: 1, arbiterAnswered: 0, arbiterFailures: 0 });
   });
 
   it('does not invent a result text for a call that carried none', () => {

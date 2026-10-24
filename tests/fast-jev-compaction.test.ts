@@ -632,10 +632,10 @@ describe('compact', () => {
     });
     expect(output.decisions[1]).toMatchObject({ id: 't2', action: 'stub_call', keepCall: 0.05 });
     expect(output.decisions[1]?.judged).toBeUndefined();
-    expect(output.stats).toMatchObject({ arbitrated: 1, arbiterFlips: 1 });
+    expect(output.stats).toMatchObject({ arbiterReviewed: 1, arbiterFlips: 1 });
 
     const silent = await compact(transcript(), judge, { preserveRecentMessages: 1, arbiter, arbitrateBand: 0 });
-    expect(silent.stats).toMatchObject({ arbitrated: 0, arbiterFlips: 0 });
+    expect(silent.stats).toMatchObject({ arbiterReviewed: 0, arbiterFlips: 0 });
     expect(silent.decisions[0]?.action).toBe('stub_call');
 
     expect(isBorderline({ resultChars: 20, tombstone: false }, { keepCall: 0.64, keepResult: 0 }, defaults)).toBe(true);

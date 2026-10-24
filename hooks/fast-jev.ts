@@ -384,7 +384,7 @@ export function probabilityProfile(result: CompactResult): string {
   if (decisions.length === 0) return '';
   const asked = decisions.filter((d) => d.resultAsked);
   const call = `call p: ${bands(decisions.map((d) => d.keepCall))}`;
-  const arbitrated = result.stats.arbitrated > 0 ? ` | arbiter: ${result.stats.arbitrated} re-judged, ${result.stats.arbiterFlips} flipped` : '';
+  const arbitrated = result.stats.arbiterReviewed > 0 ? ` | arbiter: ${result.stats.arbiterReviewed} reviewed, ${result.stats.arbiterFlips} flipped` : '';
   if (asked.length === 0) return `${call}${arbitrated}`;
   return `${call} | result p (${asked.length} asked): ${bands(asked.map((d) => d.keepResult))}${arbitrated}`;
 }
