@@ -617,6 +617,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
       await record($, `${tag} fallback to built-in summary (${reason})`);
       return next(event);
     }
+  }).catch(async ($, event, next) => {
+    // A throw before the handler's own catch, an overrun or a misreturn: the
+    // built-in summary must still run rather than the compaction failing.
+    const line = `[${event.trigger}] jev failed (${next.error.kind}); built-in summary`;
+    try {
+      $.ui.log(line);
+      await record($, line);
+    } catch {
+      // a log that cannot be written must not stop the fallback
+    }
+    return next(event);
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {

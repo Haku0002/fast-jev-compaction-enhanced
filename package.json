@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Tool-call compaction for Claude Code and OpenAI API agents, with Codex export adapters and optional retrieval.",
   "type": "module",
   "license": "MIT",

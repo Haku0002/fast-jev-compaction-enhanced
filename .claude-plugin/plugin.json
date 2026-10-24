@@ -1,9 +1,12 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Verbatim tool-call-scored compaction for Claude Code sessions: Jev, or Haiku through the session itself (no extra key).",
   "license": "MIT",
-  "author": { "name": "Haku0002", "url": "https://github.com/Haku0002" },
+  "author": {
+    "name": "Haku0002",
+    "url": "https://github.com/Haku0002"
+  },
   "userConfig": {
     "backend": {
       "type": "string",
@@ -136,5 +139,6 @@
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
     }
-  }
+  },
+  "icon": "icon.png"
 }
