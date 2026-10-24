@@ -682,7 +682,7 @@ export async function compact(
       machineBlocksPruned: applied.machineBlocksPruned,
       stateTokens: requests.reduce((max, request) => Math.max(max, request.tokens), 0),
       requests: requests.length,
-      arbitrated: arbitration.asked,
+      arbiterReviewed: arbitration.asked,
       arbiterAnswered: overrides.size,
       arbiterFlips,
       arbiterFailures: arbitration.failed,

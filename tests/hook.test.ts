@@ -181,7 +181,7 @@ describe('compactSession', () => {
     });
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({ url: 'https://api.openai.com/v1/responses', authorization: 'Bearer openai-test-key', body: { model: 'chosen-model', store: false } });
-    expect(result.stats.arbitrated).toBe(0);
+    expect(result.stats.arbiterReviewed).toBe(0);
     await expect(compactSession(transcript(), { ...config, openaiApiKey: undefined }, { fetch: jevFetch(() => 0) })).rejects.toThrow(/OPENAI_API_KEY/);
     await expect(compactSession(transcript(), { ...config, openaiModel: undefined }, { fetch: jevFetch(() => 0) })).rejects.toThrow(/openaiModel/);
     expect(selectBackend(resolveHookConfig({ openaiApiKey: 'k' }))).toBe('claude');
@@ -264,8 +264,8 @@ describe('compactSession', () => {
     expect(prompts[0]?.prompt).toContain('- call_t1:');
     expect(prompts[0]?.prompt).not.toContain('- call_t2:');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_result', 'stub_call']);
-    expect(output.stats).toMatchObject({ arbitrated: 1, arbiterFlips: 1 });
-    expect(summarize(output)).toContain('arbiter: 1 re-judged, 1 flipped');
+    expect(output.stats).toMatchObject({ arbiterReviewed: 1, arbiterFlips: 1 });
+    expect(summarize(output)).toContain('arbiter: 1 reviewed, 1 flipped');
     expect(decisionLines(output)[0]).toBe('  t1 Read drop_result call=0.90(jev 0.40) result=0.20(jev 0.05) 1000ch src/a.ts');
 
     expect(pickArbiter({ ...config, arbiterModel: '' }, { fetch: jevFetch(() => 0), complete })).toBeUndefined();

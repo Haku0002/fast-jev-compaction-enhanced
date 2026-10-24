@@ -274,8 +274,8 @@ export interface CompactStats {
   /** Estimated tokens of the largest request state. */
   stateTokens: number;
   requests: number;
-  /** Calls the arbiter was asked about, how many it answered, and how many of those changed action. */
-  arbitrated: number;
+  /** Calls sent to the arbiter for a second opinion, which it answered, and how many of those changed action. */
+  arbiterReviewed: number;
   arbiterAnswered: number;
   arbiterFlips: number;
   /** Arbiter requests that failed; their calls kept the judge's answers. */
